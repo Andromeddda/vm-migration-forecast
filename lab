@@ -1,0 +1,16 @@
+#!/bin/sh
+# Stage zero deliberately requires no system Python and no package manager.
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+UV=${VMFORECAST_UV_BIN:-uv}
+if ! command -v "$UV" >/dev/null 2>&1; then
+    printf '%s\n' 'Не найден uv. Установите standalone uv по README или задайте VMFORECAST_UV_BIN.' >&2
+    exit 1
+fi
+# Avoid accidental reuse of another activated virtual environment.
+unset VIRTUAL_ENV CONDA_PREFIX
+VERSION=$(cat "$ROOT/.python-version")
+"$UV" python install "$VERSION"
+PYTHON=$("$UV" python find --managed-python "$VERSION")
+export VMFORECAST_UV_BIN="$UV" PYTHONDONTWRITEBYTECODE=1
+exec "$PYTHON" -B "$ROOT/deployment/cli.py" "$@"

@@ -1,0 +1,19 @@
+# Current implementation: window signals and fixed-cohort replay.
+synthetic:
+  ticks: 96
+  services: 8
+  hosts: 3
+  warmup: 8
+  scenario: returning_burst
+  seeds: [0, 1, 2]
+simulation:
+  warmup: 8
+  horizon: 1
+  migration_duration_ticks: 0
+  max_concurrent: 3
+  overhead_cpu: 0.0
+  overhead_mem: 0.0
+prices: [0.0, 0.03, 0.3]
+signals:
+  max_12: {window: 12, mode: max}
+  p95_12: {window: 12, mode: quantile, quantile: 0.95}

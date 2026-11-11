@@ -1,0 +1,23 @@
+# No participant configuration or generated data belongs to source control.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*credentials*.json
+*token*.json
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
+.pytest_cache/
+data/
+runs/
+*.parquet
+*.npz
+*.png
+*.zip
+AGENTS.md
