@@ -3,7 +3,7 @@
 ## Клонировать проект
 
 ```sh
-git clone <URL> && cd <PROJECT_DIR>
+git clone https://github.com/Andromeddda/vm-migration-forecast && cd vm-migration-forecast
 ```
 
 ## Проверить требования
@@ -36,23 +36,12 @@ sh lab install-gcloud
 
 ## Настроить BigQuery Sandbox
 
-1. Войти в Google Account:
+1. Войти в Google Cloud консоль:
    https://console.cloud.google.com/bigquery
-2. Принять условия:
-   выбрать страну → отметить **Terms of Service** → **Agree and continue**.
-3. Создать проект:
-   **Create project** → заполнить **Project name** → **Create**.
-   Для существующего аккаунта: селектор проекта сверху → **New project**.
-4. Выбрать проект:
-   селектор проекта сверху → выбрать созданный проект → проверить надпись **Sandbox**.
-5. Скопировать Project ID:
-   селектор проекта сверху → столбец **ID**.
 
-- Не привязывать платёжный аккаунт или карту.
-- Не включать Free Trial и не нажимать Upgrade.
-- Не проходить подтверждение по номеру телефона.
-- При запросе карты или телефона остановить настройку.
-- Работать в пределах 1 ТиБ запросов в месяц.
+2. Создать проект
+
+4. Скопировать Project ID
 
 ## Сохранить настройки
 
@@ -107,12 +96,11 @@ sh lab bootstrap
 sh lab configure --project ""
 sh lab bootstrap
 ```
-
 Открыть ноутбук 02 или 03.
 
 ## Остановить Jupyter
 
-Нажать **Ctrl+C** в терминале.
+**Ctrl+C** в терминале.
 
 ## Проверить проект
 
