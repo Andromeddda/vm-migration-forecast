@@ -61,7 +61,9 @@ def test_run_resume_and_corruption_recovery(tmp_path):
 
 def test_query_scope_and_config_validation():
     q=build_queries(ExtractionConfig(source_project='public-source'))
-    assert 'LIMIT @n' in q['cohort'] and '@keys' in q['usage']
+    assert 'cohort_rank <= @n' in q['usage'] and '@keys' in q['events']
+    assert 'cohort' not in q
+    assert q['usage'].count('`public-source.clusterdata_2019_a.instance_usage`') == 1
     assert 'time < @t1' in q['events'] and 'time >= @t0' not in q['events']
     with pytest.raises(ValueError):ExtractionConfig(cell='a` WHERE true')
 

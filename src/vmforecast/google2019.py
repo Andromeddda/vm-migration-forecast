@@ -47,43 +47,56 @@ class ExtractionConfig:
 
 def build_queries(config):
     p = config.table_prefix
-    cohort = f'''
-    SELECT collection_id, instance_index
-    FROM `{p}.instance_usage`
-    WHERE collection_type = 0
-      AND (alloc_collection_id IS NULL OR alloc_collection_id = 0)
-      AND machine_id > 0
-      AND start_time < @prefix_end AND end_time > @t0
-      AND end_time > start_time
-      AND average_usage.cpus IS NOT NULL AND average_usage.memory IS NOT NULL
-    GROUP BY collection_id, instance_index
-    HAVING SUM(LEAST(end_time, @prefix_end) - GREATEST(start_time, @t0)) = @prefix_end - @t0
-    ORDER BY FARM_FINGERPRINT(CONCAT(CAST(collection_id AS STRING), ':',
-             CAST(instance_index AS STRING))), collection_id, instance_index
-    LIMIT @n
-    '''
+    # One reference to the source: compute prefix coverage on the full requested
+    # interval, qualify services on prefix ONLY, then rank distinct service keys.
+    # DENSE_RANK assigns the same rank to every row of one service. IDs break hash ties.
     usage = f'''
+    WITH samples AS (
+        SELECT start_time, end_time, collection_id, instance_index, machine_id,
+               average_usage.cpus AS cpu, average_usage.memory AS mem, sample_rate
+        FROM `{p}.instance_usage`
+        WHERE collection_type = 0
+          AND (alloc_collection_id IS NULL OR alloc_collection_id = 0)
+          AND machine_id > 0
+          AND start_time < @t1 AND end_time > @t0 AND end_time > start_time
+    ), covered AS (
+        SELECT *,
+               SUM(CASE WHEN start_time < @prefix_end
+                             AND cpu IS NOT NULL AND mem IS NOT NULL
+                        THEN LEAST(end_time, @prefix_end) - GREATEST(start_time, @t0)
+                        ELSE 0 END)
+               OVER (PARTITION BY collection_id, instance_index) AS prefix_coverage
+        FROM samples
+    ), ranked AS (
+        SELECT *, DENSE_RANK() OVER (
+            ORDER BY FARM_FINGERPRINT(CONCAT(CAST(collection_id AS STRING), ':',
+                     CAST(instance_index AS STRING))), collection_id, instance_index
+        ) AS cohort_rank
+        FROM covered
+        WHERE prefix_coverage = @prefix_end - @t0
+    )
     SELECT start_time, end_time, collection_id, instance_index, machine_id,
-           average_usage.cpus AS cpu, average_usage.memory AS mem, sample_rate
-    FROM `{p}.instance_usage`
-    WHERE collection_type = 0
-      AND (alloc_collection_id IS NULL OR alloc_collection_id = 0)
-      AND machine_id > 0
-      AND start_time < @t1 AND end_time > @t0 AND end_time > start_time
-      AND CONCAT(CAST(collection_id AS STRING), ':',
-                 CAST(instance_index AS STRING)) IN UNNEST(@keys)
+           cpu, mem, sample_rate
+    FROM ranked
+    WHERE cohort_rank <= @n
     ORDER BY collection_id, instance_index, start_time, end_time
     '''
-    events = f'''
+    events_scan = f'''
     SELECT time, type, collection_id, instance_index, machine_id, missing_type,
            resource_request.cpus AS cpu_request, resource_request.memory AS mem_request
     FROM `{p}.instance_events`
     WHERE time < @t1
+    '''
+    events = events_scan + '''
       AND CONCAT(CAST(collection_id AS STRING), ':',
                  CAST(instance_index AS STRING)) IN UNNEST(@keys)
     ORDER BY collection_id, instance_index, time, type
     '''
-    return {'cohort':cohort, 'usage':usage, 'events':events}
+    # events_scan is for dry-run planning ONLY: full matching events before IDs exist.
+    return {'usage': usage, 'events': events, 'events_scan': events_scan}
+
+
+EXTRACTION_STRATEGY = 'combined_usage_v1'
 
 
 class BoundedExtractor:
@@ -98,6 +111,10 @@ class BoundedExtractor:
                 raise ValueError('Different extraction config: use a separate output directory')
         else:
             self.ledger = {'source_config':asdict(config), 'jobs':[]}
+        if self.ledger.get('strategy') != EXTRACTION_STRATEGY and self.ledger['jobs']:
+            raise ValueError('Legacy extraction ledger: keep it for accounting and use a separate '
+                             'output directory for combined extraction; do not reset spent quota')
+        self.ledger['strategy'] = EXTRACTION_STRATEGY
         self.location = None
 
     def metadata(self):
@@ -114,21 +131,78 @@ class BoundedExtractor:
         json_write(self.directory/'source_metadata.json', {'location':self.location,'tables':tables})
         return tables
 
-    def query(self, name, sql, params, execute=False):
+    def _usage_params(self):
+        from google.cloud import bigquery
+        cfg = self.config
+        return [
+            bigquery.ScalarQueryParameter('t0', 'INT64', cfg.t0),
+            bigquery.ScalarQueryParameter('t1', 'INT64', cfg.t1),
+            bigquery.ScalarQueryParameter('prefix_end', 'INT64',
+                                         cfg.t0 + cfg.prefix_hours * 3600 * 1_000_000),
+            bigquery.ScalarQueryParameter('n', 'INT64', cfg.n_services),
+        ]
+
+    def _estimate(self, sql, params):
         from google.cloud import bigquery
         if self.location is None:
             self.metadata()
         dry = self.client.query(sql, location=self.location,
-            job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False, query_parameters=params))
-        estimated = dry.total_bytes_processed
-        spent = sum(j.get('budget_charge_bytes',0) for j in self.ledger['jobs'])
-        remaining = self.config.total_budget_bytes-spent
-        cap = min(self.config.max_query_bytes,remaining)
-        plan = {'name':name,'estimated_bytes':estimated,'cap_bytes':cap,
-                'remaining_budget_bytes':remaining,'execute':execute}
+            job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False,
+                                               query_parameters=params))
+        return dry.total_bytes_processed
+
+    def _budget_plan(self, name, estimated):
+        spent = sum(j.get('budget_charge_bytes', 0) for j in self.ledger['jobs'])
+        remaining = self.config.total_budget_bytes - spent
+        cap = min(self.config.max_query_bytes, remaining)
+        reasons = []
+        if estimated is None:
+            reasons.append('unknown_scan')
+        else:
+            if estimated > self.config.max_query_bytes:
+                reasons.append('per_query_limit')
+            if estimated > remaining:
+                reasons.append('remaining_budget')
+        if cap <= 0:
+            reasons.append('budget_exhausted')
+        return {'name': name, 'estimated_bytes': estimated,
+                'max_query_bytes': self.config.max_query_bytes,
+                'ledger_charge_bytes': spent, 'remaining_budget_bytes': remaining,
+                'cap_bytes': cap, 'allowed': not reasons, 'reasons': reasons}
+
+    def plan(self):
+        """Two dry runs, no real queries/reservations even if estimates exceed limits.
+
+        Events estimate intentionally omits the cohort filter: a conservative source
+        scan estimate before keys exist, NOT an exact forecast for targeted events.
+        This estimates logical processing, not download bytes or the Sandbox balance.
+        """
+        from google.cloud import bigquery
+        q = build_queries(self.config)
+        usage = self._budget_plan('usage', self._estimate(q['usage'], self._usage_params()))
+        events = self._budget_plan('events_scan', self._estimate(q['events_scan'], [
+            bigquery.ScalarQueryParameter('t1', 'INT64', self.config.t1)]))
+        values = [usage['estimated_bytes'], events['estimated_bytes']]
+        total = None if None in values else sum(values)
+        fits = (total is not None and total <= usage['remaining_budget_bytes']
+                and usage['allowed'] and events['allowed'])
+        return {'strategy': EXTRACTION_STRATEGY, 'usage': usage,
+                'events_scan_upper_estimate': events,
+                'total_scan_upper_estimate_bytes': total,
+                'fits_configured_budget_conservatively': fits,
+                'note': 'Events omit cohort filtering; actual events are checked again. '
+                        'Estimates are not download sizes or remaining Google quota.'}
+
+    def query(self, name, sql, params, execute=False):
+        from google.cloud import bigquery
+        estimated = self._estimate(sql, params)
+        plan = self._budget_plan(name, estimated)
+        plan['execute'] = execute
         print(plan)
-        if estimated is None or estimated > cap or cap <= 0:
-            raise RuntimeError('Unknown/too-large scan: query NOT executed; revise extraction or explicit budget')
+        if not plan['allowed']:
+            raise RuntimeError('Scan budget rejected: ' + json.dumps(plan, sort_keys=True)
+                               + '; query NOT executed')
+        cap = plan['cap_bytes']
         if not execute:
             return None
         # Reserve the full cap BEFORE execution. Unknown outcomes keep their reservation.
@@ -157,29 +231,30 @@ class BoundedExtractor:
         return frame
 
     def extract(self, execute=False):
-        """Dry-run only by default. Execution uses prefix cohort then targeted usage/events."""
+        """Combined cohort+usage scan, followed by targeted events; dry-run by default."""
         from google.cloud import bigquery
         cfg = self.config
         q = build_queries(cfg)
-        cohort = self.query('cohort',q['cohort'],[
-            bigquery.ScalarQueryParameter('t0','INT64',cfg.t0),
-            bigquery.ScalarQueryParameter('prefix_end','INT64',cfg.t0+cfg.prefix_hours*3600*1_000_000),
-            bigquery.ScalarQueryParameter('n','INT64',cfg.n_services)],execute)
-        if cohort is None:
-            print('Only cohort dry-run is available before its IDs are selected. No data query executed.')
+        if not execute:
+            print(json.dumps(self.plan(), indent=2))
             return None
-        if cohort.empty:
-            raise RuntimeError('Empty prefix cohort')
-        keys = [f'{int(r.collection_id)}:{int(r.instance_index)}' for r in cohort.itertuples(index=False)]
-        params = [bigquery.ScalarQueryParameter('t0','INT64',cfg.t0),
-                  bigquery.ScalarQueryParameter('t1','INT64',cfg.t1),
-                  bigquery.ArrayQueryParameter('keys','STRING',keys)]
-        usage = self.query('usage',q['usage'],params,execute)
-        events = self.query('events',q['events'],params[1:],execute)
+        usage = self.query('usage', q['usage'], self._usage_params(), execute=True)
+        if usage.empty:
+            raise RuntimeError('Empty prefix cohort; events query not executed')
+        # Reconstruct the same cohort without another BigQuery job or reservation.
+        cohort = usage[['collection_id', 'instance_index']].drop_duplicates().sort_values(
+            ['collection_id', 'instance_index']).reset_index(drop=True)
+        cohort.to_parquet(self.directory/'cohort.parquet', index=False)
+        keys = [f'{int(r.collection_id)}:{int(r.instance_index)}'
+                for r in cohort.itertuples(index=False)]
+        events = self.query('events', q['events'], [
+            bigquery.ScalarQueryParameter('t1', 'INT64', cfg.t1),
+            bigquery.ArrayQueryParameter('keys', 'STRING', keys)], execute=True)
         json_write(self.directory/'extraction_manifest.json', {
             'source':'https://github.com/google/cluster-data/blob/master/ClusterData2019.md',
-            'license':'CC-BY', 'config':asdict(cfg),'cohort_keys':keys,
-            'queries':{k:hashlib.sha256(v.encode()).hexdigest() for k,v in q.items()},
+            'license':'CC-BY', 'strategy': EXTRACTION_STRATEGY,
+            'config':asdict(cfg), 'cohort_keys':keys,
+            'queries':{k:hashlib.sha256(q[k].encode()).hexdigest() for k in ('usage', 'events')},
             'files':{name:file_hash(self.directory/name) for name in
                      ['cohort.parquet','usage.parquet','events.parquet']}})
         return usage, events
@@ -193,7 +268,7 @@ def main():
     settings = Settings.load()
     parser.add_argument('--project', default=settings.project, help='Sandbox query project ID; default from participant configuration')
     parser.add_argument('--source-project', default=settings.source_project)
-    parser.add_argument('--output', default=str(settings.data/'google2019_a_6h_20'))
+    parser.add_argument('--output', default=str(settings.data/'google2019_combined_a_6h_20'))
     parser.add_argument('--cell', default='a', choices=list('abcdefgh'))
     parser.add_argument('--hours', type=int, default=6)
     parser.add_argument('--services', type=int, default=20)
