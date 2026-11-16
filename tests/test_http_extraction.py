@@ -293,3 +293,191 @@ def test_worker_ram_ceiling_terminates_child(tmp_path,monkeypatch):
     with pytest.raises(h.Paused,match='RSS'):
         h.supervise(tmp_path,tmp_path,{'rss_mib':1})
     assert killed==[(123456,h.signal.SIGTERM)]
+
+
+def test_prefetch_is_parallel_bounded_and_ordered(trace,monkeypatch):
+    work,out,cfg,_,_=trace
+    cfg.update(network_workers=2,prefetch_shards=2)
+    second_started,third_finished=threading.Event(),threading.Event()
+    lock=threading.Lock()
+    active,maximum=0,0
+    called=[]
+    paths=[]
+    def fake_fetch(obj,path,columns,download_cfg):
+        nonlocal active,maximum
+        with lock:
+            active+=1
+            maximum=max(maximum,active)
+            called.append(obj['number'])
+            paths.append(path)
+        try:
+            if obj['number']==1:
+                assert second_started.wait(5),'Second network thread did not overlap the first'
+            elif obj['number']==2:
+                second_started.set()
+            path.write_bytes(b'downloaded')
+            if obj['number']==3:
+                third_finished.set()
+            return 1,10
+        finally:
+            with lock:
+                active-=1
+    monkeypatch.setattr(h,'fetch_sparse',fake_fetch)
+    jobs=[(i,{'number':i},None) for i in range(1,7)]
+    with h.prefetch_downloads(work,out,cfg,jobs) as stream:
+        first=next(stream)
+        assert first[0]==1
+        # While the consumer owns shard 1, the network finishes successors 2 and 3.
+        assert third_finished.wait(5),'No download overlapped the processing slot'
+        assert sorted(called)==[1,2,3]
+        assert len(list((work/'http-prefetch').glob('*')))==3
+        assert len(set(paths))==3
+        assert [first[0]]+[row[0] for row in stream]==list(range(1,7))
+    assert maximum==2
+    assert not (work/'http-prefetch').exists()
+
+
+def test_zero_prefetch_disables_overlap(trace,monkeypatch):
+    work,out,cfg,_,_=trace
+    cfg.update(network_workers=2,prefetch_shards=0)
+    called=[]
+    def fetch(obj,path,columns,download_cfg):
+        called.append(obj)
+        path.write_bytes(b'x')
+        return 1,1
+    monkeypatch.setattr(h,'fetch_sparse',fetch)
+    with h.prefetch_downloads(work,out,cfg,[(i,i,None) for i in range(3)]) as stream:
+        first=next(stream)
+        assert called==[0]
+        assert [first[0]]+[x[0] for x in stream]==[0,1,2]
+    assert not (work/'http-prefetch').exists()
+
+
+def test_prefetch_cancellation_interrupts_retry_wait(trace,monkeypatch):
+    work,out,cfg,_,_=trace
+    cfg.update(network_workers=2,prefetch_shards=1)
+    waiting=threading.Event()
+    cancelled=threading.Event()
+    def fetch(obj,path,columns,download_cfg):
+        if obj==1:
+            waiting.set()
+            assert download_cfg['_download_stop'].wait(5)
+            cancelled.set()
+            raise h.Paused('download cancelled')
+        path.write_bytes(b'x')
+        return 1,1
+    monkeypatch.setattr(h,'fetch_sparse',fetch)
+    with h.prefetch_downloads(work,out,cfg,[(i,i,None) for i in range(2)]) as stream:
+        assert next(stream)[0]==0
+        assert waiting.wait(5)
+        # Exit without consuming the successor: its retry wait must be interrupted.
+    assert cancelled.is_set()
+    assert not (work/'http-prefetch').exists()
+
+
+def test_processing_failure_rolls_back_despite_finished_prefetch(trace,monkeypatch):
+    work,out,cfg,files,_=trace
+    connect=h.connect_db
+    calls=0
+    owner=threading.get_ident()
+    class FailingWriter:
+        def __init__(self,db):
+            self.db=db
+        def __getattr__(self,name):
+            return getattr(self.db,name)
+        def execute(self,sql,*args):
+            nonlocal calls
+            assert threading.get_ident()==owner,'A download thread touched DuckDB'
+            if sql.startswith('INSERT INTO prefix '):
+                calls+=1
+                if calls==2:
+                    raise RuntimeError('simulated mid-shard processing failure')
+            return self.db.execute(sql,*args)
+    monkeypatch.setattr(h,'connect_db',lambda *a,**kw:FailingWriter(connect(*a,**kw)))
+    with pytest.raises(RuntimeError,match='mid-shard'):
+        h.ingest(work,out,cfg,files,'prefix')
+    db=connect(work,cfg)
+    assert db.execute('SELECT count(*) FROM done').fetchone()[0]==0
+    assert db.execute('SELECT count(*) FROM prefix').fetchone()[0]==0
+    db.close()
+    assert not (work/'http-prefetch').exists()
+    monkeypatch.setattr(h,'connect_db',connect)
+    h.ingest(work,out,cfg,files,'prefix')
+    db=connect(work,cfg)
+    assert db.execute('SELECT count(*) FROM prefix').fetchone()[0]==36
+    db.close()
+
+
+def test_v1_checkpoint_and_config_resume_through_cli(trace,monkeypatch):
+    import subprocess
+    import sys
+    work,out,cfg,files,requests=trace
+    script=Path(__file__).parents[1]/'tools/download_google2019.py'
+    argv=['download','--work',str(work),'--output',str(out),'--days','0.125',
+          '--max-objects','3','--target-gb','0.1','--reserve-gb','1',
+          '--memory-mib','128','--rss-mib','1024','--threads','1','--batch-rows','7','--keep-stage']
+    old_cfg=vars(h.parser().parse_args(argv)).copy()
+    for key in ('command','network_workers','prefetch_shards'):
+        old_cfg.pop(key)
+    old_cfg.update(work=str(work.resolve()),output=str(out.resolve()),format_version=1,
+                   t1=old_cfg['t0']+int(old_cfg['days']*24*3600_000_000))
+    h.atomic_json(work/'config.json',old_cfg)
+    h.atomic_json(work/'sources.json',files)
+    # Exact v1 schemas/checkpoint semantics; neither prefetch nor new config keys exist.
+    first=next(x for x in files if x['table']=='instance_usage')
+    cache=work/'source.partial.parquet'
+    rows,network=h.fetch_sparse(first,cache,h.PREFIX_COLUMNS,cfg)
+    db=h.connect_db(work,cfg)
+    db.execute('CREATE TABLE done(phase VARCHAR,name VARCHAR,rows BIGINT,network_bytes BIGINT,'
+               'PRIMARY KEY(phase,name))')
+    db.execute('CREATE TABLE prefix(collection_id BIGINT,instance_index BIGINT,a BIGINT,b BIGINT)')
+    reader=pq.ParquetFile(cache)
+    for batch in reader.iter_batches(columns=h.PREFIX_COLUMNS,use_threads=False):
+        db.register('incoming',batch)
+        end=cfg['t0']+3600_000_000
+        db.execute('INSERT INTO prefix SELECT collection_id,instance_index,'
+                   f'greatest(start_time,{cfg["t0"]}),least(end_time,{end}) FROM incoming WHERE '
+                   +h.usage_where(cfg['t0'],end,prefix=True))
+        db.unregister('incoming')
+    db.execute('INSERT INTO done VALUES (?,?,?,?)',['prefix',first['name'],rows,network])
+    db.execute('CHECKPOINT')
+    db.close()
+    reader.close()
+    # Restart only prefix first: the previously committed shard must not make HTTP requests.
+    fetched=[]
+    original=h.fetch_sparse
+    def record(obj,*a,**kw):
+        fetched.append(obj['name'])
+        return original(obj,*a,**kw)
+    monkeypatch.setattr(h,'fetch_sparse',record)
+    h.ingest(work,out,cfg,files,'prefix')
+    assert first['name'] not in fetched
+    assert len(fetched)==1
+    # Old JSON still lacks new keys; CLI must migrate operational settings, finish, and verify.
+    result=subprocess.run([sys.executable,str(script),*argv,'--network-workers','2',
+                           '--prefetch-shards','2'],capture_output=True,text=True,timeout=60)
+    assert result.returncode==0,result.stdout+result.stderr
+    new_cfg=json.loads((work/'config.json').read_text())
+    assert new_cfg['network_workers']==2 and new_cfg['prefetch_shards']==2
+    db=h.connect_db(work,new_cfg)
+    assert db.execute('SELECT count(*) FROM prefix').fetchone()[0]==36
+    assert db.execute('SELECT rows,network_bytes FROM done WHERE phase=? AND name=?',
+                      ['prefix',first['name']]).fetchone()==(rows,network)
+    assert db.execute("SELECT count(*) FROM done WHERE phase='prefix'").fetchone()[0]==2
+    db.close()
+    assert h.verify_dataset(out)['instances']==3
+
+
+def test_parallel_and_sequential_outputs_are_identical(trace):
+    work,out,cfg,files,_=trace
+    cfg.update(network_workers=2,prefetch_shards=2)
+    h.worker(work,out,cfg,files)
+    seq_work,seq_out=work.parent/'sequential-work',out.parent/'sequential-output'
+    seq_work.mkdir()
+    seq_out.mkdir()
+    sequential=dict(cfg,network_workers=1,prefetch_shards=0,
+                    work=str(seq_work),output=str(seq_out))
+    h.worker(seq_work,seq_out,sequential,files)
+    for path in out.rglob('*.parquet'):
+        if path.is_file():
+            assert pq.read_table(path).equals(pq.read_table(seq_out/path.relative_to(out)))

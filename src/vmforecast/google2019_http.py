@@ -7,6 +7,8 @@ SQL below runs in local DuckDB; it never invokes BigQuery or a cloud SQL service
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import errno
 import fcntl
@@ -23,6 +25,7 @@ import signal
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -63,7 +66,15 @@ def atomic_json(path, value):
 
 def tree_bytes(root):
     # Apparent size is deliberately conservative for the sparse source cache.
-    return sum(p.stat().st_size for p in Path(root).rglob('*') if p.is_file())
+    total = 0
+    for path in Path(root).rglob('*'):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except FileNotFoundError:
+            # A prefetch/consumer thread may remove a cache file between stat calls.
+            continue
+    return total
 
 
 def publish(source, destination):
@@ -91,7 +102,8 @@ def setup_log(work):
         LOG.addHandler(handler)
 
 
-def get_bytes(url, expected=None, start=None, generation=None, retry_hours=12):
+def get_bytes(url, expected=None, start=None, generation=None, retry_hours=12,
+              cancel_event=None):
     """Bounded response, exact Range validation; only transient failures are retried."""
     if generation:
         url += ('&' if '?' in url else '?') + urllib.parse.urlencode({'generation': generation})
@@ -101,6 +113,8 @@ def get_bytes(url, expected=None, start=None, generation=None, retry_hours=12):
     deadline = time.monotonic() + retry_hours*3600
     attempt = 0
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise Paused('HTTP prefetch cancelled')
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as r:
                 if start is not None:
@@ -126,7 +140,10 @@ def get_bytes(url, expected=None, start=None, generation=None, retry_hours=12):
         delay = min(60, 2**min(attempt, 6)) + random.random()
         if attempt == 1 or attempt % 20 == 0:
             LOG.warning('HTTP retry %s in %.1fs: %s', attempt, delay, error)
-        time.sleep(delay)
+        if cancel_event is None:
+            time.sleep(delay)
+        elif cancel_event.wait(delay):
+            raise Paused('HTTP prefetch cancelled')
 
 
 def list_sources(cell, tables=TABLES):
@@ -162,7 +179,7 @@ def fetch_sparse(obj, path, columns, cfg):
         raise Paused(f'Unexpected source size {size}: {obj["name"]}')
     def fetch(a, n):
         return get_bytes(obj['url'], expected=n, start=a, generation=obj.get('generation'),
-                         retry_hours=cfg['retry_hours'])
+                         retry_hours=cfg['retry_hours'],cancel_event=cfg.get('_download_stop'))
     tail = fetch(size-8, 8)
     if tail[4:] != b'PAR1':
         raise Paused(f'Not plain Parquet: {obj["name"]}')
@@ -247,6 +264,77 @@ def usage_where(t0, t1, prefix=False):
     return base
 
 
+def source_columns(phase,table,cfg):
+    if phase=='prefix':
+        return PREFIX_COLUMNS
+    if cfg['columns']=='core':
+        if table=='instance_usage':
+            return CORE_USAGE
+        if table=='instance_events':
+            return CORE_EVENTS
+    return None
+
+
+@contextlib.contextmanager
+def prefetch_downloads(work,output,cfg,jobs):
+    """Bound in-flight + ready files, keeping one ordered DuckDB consumer.
+
+    The current processing file plus at most prefetch_shards successors exist.
+    Only the caller touches DuckDB. Downloads never mark a shard as done.
+    """
+    cache_dir = work/'http-prefetch'
+    # The work lock belongs to the supervisor; no previous worker is running here.
+    shutil.rmtree(cache_dir,ignore_errors=True)
+    cache_dir.mkdir()
+    (work/'source.partial.parquet').unlink(missing_ok=True)  # Old-version uncommitted cache.
+    stop = threading.Event()
+    capacity = cfg.get('prefetch_shards',2)+1
+    executor = ThreadPoolExecutor(max_workers=min(cfg.get('network_workers',2),capacity),
+                                  thread_name_prefix='parquet-http')
+    pending = deque()
+    source = iter(jobs)
+    download_cfg = dict(cfg,_download_stop=stop)
+
+    def download(obj,cache,columns):
+        started = time.monotonic()
+        rows,network = fetch_sparse(obj,cache,columns,download_cfg)
+        return rows,network,time.monotonic()-started
+
+    def advance():
+        while len(pending)<capacity:
+            try:
+                number,obj,columns = next(source)
+            except StopIteration:
+                break
+            guard(work,output,cfg)
+            cache = cache_dir/f'{number:08d}.partial.parquet'
+            pending.append((number,obj,columns,cache,
+                            executor.submit(download,obj,cache,columns)))
+
+    def consume():
+        advance()
+        while pending:
+            number,obj,columns,cache,future = pending.popleft()
+            rows,network,seconds = future.result()
+            try:
+                yield number,obj,columns,cache,rows,network,seconds
+            finally:
+                cache.unlink(missing_ok=True)
+            advance()
+
+    iterator = consume()
+    try:
+        yield iterator
+    finally:
+        stop.set()
+        for *_,future in pending:
+            future.cancel()
+        # Retrying calls wake immediately; an in-flight HTTP call has its 60s timeout.
+        executor.shutdown(wait=True,cancel_futures=True)
+        iterator.close()
+        shutil.rmtree(cache_dir,ignore_errors=True)
+
+
 def ingest(work, output, cfg, sources, phase):
     import pyarrow.parquet as pq
     db = connect_db(work, cfg)
@@ -255,67 +343,75 @@ def ingest(work, output, cfg, sources, phase):
     if phase == 'prefix':
         db.execute('CREATE TABLE IF NOT EXISTS prefix(collection_id BIGINT, instance_index BIGINT, '
                    'a BIGINT,b BIGINT)')
-    for number, obj in enumerate(sources):
-        table = obj['table']
-        if phase == 'prefix' and table != 'instance_usage':
-            continue
-        if db.execute('SELECT 1 FROM done WHERE phase=? AND name=?', [phase, obj['name']]).fetchone():
-            continue
-        guard(work, output, cfg)
-        cache = work/'source.partial.parquet'
-        columns = PREFIX_COLUMNS if phase == 'prefix' else None
-        if phase == 'data' and cfg['columns'] == 'core':
-            columns = CORE_USAGE if table == 'instance_usage' else (
-                CORE_EVENTS if table == 'instance_events' else None)
-        rows, transferred = fetch_sparse(obj, cache, columns, cfg)
-        reader = pq.ParquetFile(cache)
-        db.execute('BEGIN')
-        try:
-            count = 0
-            for batch in reader.iter_batches(batch_size=cfg['batch_rows'], columns=columns,
-                                             use_threads=False):
-                db.register('incoming', batch)
-                if phase == 'prefix':
-                    end = cfg['t0']+cfg['prefix_hours']*3600_000_000
-                    sql = (f'SELECT collection_id,instance_index,greatest(start_time,{cfg["t0"]}) a,'
-                           f'least(end_time,{end}) b FROM incoming WHERE '
-                           + usage_where(cfg['t0'], end, prefix=True))
-                    db.execute('INSERT INTO prefix '+sql)
-                else:
-                    if table == 'instance_usage':
-                        sql = ('SELECT i.*, average_usage.cpus AS cpu, average_usage.memory AS mem '
-                               'FROM incoming i SEMI JOIN candidates c USING(collection_id,instance_index) '
-                               'WHERE '+usage_where(cfg['t0'], cfg['t1']))
-                    elif table == 'instance_events':
-                        sql = ('SELECT i.*,resource_request.cpus AS cpu_request,'
-                               'resource_request.memory AS mem_request FROM incoming i '
-                               'SEMI JOIN candidates c USING(collection_id,instance_index) '
-                               f'WHERE time < {cfg["t1"]}')
-                    elif table == 'collection_events':
-                        sql = ('SELECT i.* FROM incoming i SEMI JOIN '
-                               '(SELECT DISTINCT collection_id FROM candidates) c USING(collection_id) '
-                               f'WHERE time < {cfg["t1"]}')
-                    else:
-                        # Host lifecycle/capacity history for the entire cell is small and useful.
-                        sql = f'SELECT * FROM incoming WHERE time < {cfg["t1"]}'
-                    db.execute(f'CREATE TABLE IF NOT EXISTS {table} AS {sql} LIMIT 0')
-                    db.execute(f'INSERT INTO {table} {sql}')
-                count += batch.num_rows
-                db.unregister('incoming')
-            if count != rows:
-                raise Paused(f'Footer/decoded row count mismatch for {obj["name"]}')
-            db.execute('INSERT INTO done VALUES (?,?,?,?)', [phase,obj['name'],rows,transferred])
-            db.execute('COMMIT')
-            db.execute('CHECKPOINT')
-        except BaseException:
-            with contextlib.suppress(Exception):
-                db.execute('ROLLBACK')
-            raise
-        finally:
-            reader.close()
-            cache.unlink(missing_ok=True)
-        LOG.info('%s %d/%d %s; source_rows=%d HTTP=%.2fMB', phase, number+1,
-                 len(sources), obj['name'], rows, transferred/1e6)
+    eligible = [obj for obj in sources if phase!='prefix' or obj['table']=='instance_usage']
+    completed = {r[0] for r in db.execute('SELECT name FROM done WHERE phase=?',[phase]).fetchall()}
+    jobs = [(number,obj,source_columns(phase,obj['table'],cfg))
+            for number,obj in enumerate(eligible,1) if obj['name'] not in completed]
+    LOG.info('%s resume: committed=%d/%d; network_workers=%d prefetch_shards=%d; next=%s',
+             phase,len(eligible)-len(jobs),len(eligible),cfg.get('network_workers',2),
+             cfg.get('prefetch_shards',2),jobs[0][1]['name'] if jobs else 'none')
+    try:
+        with prefetch_downloads(work,output,cfg,jobs) as downloads:
+            for number,obj,columns,cache,rows,transferred,download_seconds in downloads:
+                table = obj['table']
+                guard(work,output,cfg)
+                process_started = time.monotonic()
+                reader = pq.ParquetFile(cache)
+                db.execute('BEGIN')
+                try:
+                    count = 0
+                    for batch in reader.iter_batches(batch_size=cfg['batch_rows'], columns=columns,
+                                                     use_threads=False):
+                        db.register('incoming', batch)
+                        if phase == 'prefix':
+                            end = cfg['t0']+cfg['prefix_hours']*3600_000_000
+                            sql = (f'SELECT collection_id,instance_index,greatest(start_time,{cfg["t0"]}) a,'
+                                   f'least(end_time,{end}) b FROM incoming WHERE '
+                                   + usage_where(cfg['t0'], end, prefix=True))
+                            db.execute('INSERT INTO prefix '+sql)
+                        else:
+                            if table == 'instance_usage':
+                                sql = ('SELECT i.*, average_usage.cpus AS cpu, average_usage.memory AS mem '
+                                       'FROM incoming i SEMI JOIN candidates c USING(collection_id,instance_index) '
+                                       'WHERE '+usage_where(cfg['t0'], cfg['t1']))
+                            elif table == 'instance_events':
+                                sql = ('SELECT i.*,resource_request.cpus AS cpu_request,'
+                                       'resource_request.memory AS mem_request FROM incoming i '
+                                       'SEMI JOIN candidates c USING(collection_id,instance_index) '
+                                       f'WHERE time < {cfg["t1"]}')
+                            elif table == 'collection_events':
+                                sql = ('SELECT i.* FROM incoming i SEMI JOIN '
+                                       '(SELECT DISTINCT collection_id FROM candidates) c USING(collection_id) '
+                                       f'WHERE time < {cfg["t1"]}')
+                            else:
+                                # Host lifecycle/capacity history for the entire cell is small and useful.
+                                sql = f'SELECT * FROM incoming WHERE time < {cfg["t1"]}'
+                            db.execute(f'CREATE TABLE IF NOT EXISTS {table} AS {sql} LIMIT 0')
+                            db.execute(f'INSERT INTO {table} {sql}')
+                        count += batch.num_rows
+                        db.unregister('incoming')
+                    if count != rows:
+                        raise Paused(f'Footer/decoded row count mismatch for {obj["name"]}')
+                    db.execute('INSERT INTO done VALUES (?,?,?,?)', [phase,obj['name'],rows,transferred])
+                    db.execute('COMMIT')
+                    process_seconds = time.monotonic()-process_started
+                    checkpoint_started = time.monotonic()
+                    db.execute('CHECKPOINT')
+                    checkpoint_seconds = time.monotonic()-checkpoint_started
+                except BaseException:
+                    with contextlib.suppress(Exception):
+                        db.execute('ROLLBACK')
+                    raise
+                finally:
+                    reader.close()
+                    cache.unlink(missing_ok=True)
+                LOG.info('%s %d/%d %s; source_rows=%d HTTP=%.2fMB '
+                         'download=%.2fs process=%.2fs checkpoint=%.2fs',phase,number,
+                         len(eligible),obj['name'],rows,transferred/1e6,download_seconds,
+                         process_seconds,checkpoint_seconds)
+    except BaseException:
+        db.close()
+        raise
     if phase == 'prefix':
         # Reject gaps/overlaps in the initial observable prefix. Selection uses no future usage.
         end = cfg['t0']+cfg['prefix_hours']*3600_000_000
@@ -720,6 +816,10 @@ def parser():
     run.add_argument('--memory-mib',type=int,default=512,help='DuckDB buffer memory, not total RSS')
     run.add_argument('--rss-mib',type=int,default=1536,help='Supervisor ceiling for total worker RSS')
     run.add_argument('--threads',type=int,default=2)
+    run.add_argument('--network-workers',type=int,default=2,
+                     help='Concurrent HTTP shard downloads (1..4); DuckDB writer stays single')
+    run.add_argument('--prefetch-shards',type=int,default=2,
+                     help='Max successor shards queued/downloading ahead of processing (0..4)')
     run.add_argument('--batch-rows',type=int,default=16384)
     run.add_argument('--max-shard-mib',type=int,default=128)
     run.add_argument('--retry-hours',type=float,default=12)
@@ -777,6 +877,10 @@ def main(argv=None):
         or args.disk_gb < args.target_gb+args.stage_gb+args.spill_gb+4
         or args.reserve_gb<1 or args.memory_mib<128 or args.rss_mib<args.memory_mib+256
         or not 1<=args.threads<=4 or not 1<=args.batch_rows<=65536
+        or not 1<=args.network_workers<=4 or not 0<=args.prefetch_shards<=4
+        or (args.prefetch_shards+1)*args.max_shard_mib*MIB>2*GB
+        or args.disk_gb < args.target_gb+args.stage_gb+args.spill_gb+4
+                          +(args.prefetch_shards+1)*args.max_shard_mib*MIB/GB
         or not 1<=args.max_shard_mib<=512 or args.retry_hours<0):
         raise Paused('Invalid configuration / insufficient disk or RAM budget separation')
     work.mkdir(parents=True,exist_ok=True)
@@ -797,7 +901,8 @@ def main(argv=None):
             if config_path.exists():
                 previous = json.loads(config_path.read_text())
                 operational = {'disk_gb','reserve_gb','stage_gb','spill_gb','memory_mib',
-                               'rss_mib','threads','batch_rows','max_shard_mib','retry_hours','keep_stage'}
+                               'rss_mib','threads','batch_rows','max_shard_mib','retry_hours','keep_stage',
+                               'network_workers','prefetch_shards'}
                 if {k:v for k,v in previous.items() if k not in operational} != {
                         k:v for k,v in cfg.items() if k not in operational}:
                     raise Paused('Dataset configuration changed: use original selection/window/columns '
@@ -823,7 +928,7 @@ def main(argv=None):
             if not args.keep_stage:
                 for name in ('stage.duckdb','stage.duckdb.wal','source.partial.parquet'):
                     (work/name).unlink(missing_ok=True)
-                for name in ('spill','export-group'):
+                for name in ('spill','export-group','http-prefetch'):
                     shutil.rmtree(work/name,ignore_errors=True)
                 LOG.info('Verified output; freed staging DB and temporary files')
     LOG.info('Verified output complete: %s',output)
