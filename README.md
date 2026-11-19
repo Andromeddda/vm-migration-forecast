@@ -1,5 +1,9 @@
 # VM Migration Forecasting
 
+Для продолжения одной HTTP-выгрузки на двух компьютерах (обратный data-проход,
+бюджет ноутбука 30 GB и импорт без повторных строк) см.
+[docs/HTTP_PEER.md](docs/HTTP_PEER.md). Начальный prefix повторно не скачивается.
+
 ## Скачать Google 2019 без BigQuery, авторизации и браузера
 
 Для нового HTTP-экстрактора достаточно локального Python. Он собирает 30 дней
@@ -12,9 +16,7 @@
 uv venv --python 3.11 .venv-http
 uv pip install --python .venv-http/bin/python -r requirements-http.txt
 screen -S google2019
-.venv-http/bin/python tools/download_google2019.py download \
-  --output /path/to/data/google2019_http_a_30d \
-  --work /path/to/local-scratch/google2019-http
+.venv-http/bin/python tools/download_google2019.py download  --output /path/to/data/google2019_http_a_30d --work /path/to/local-scratch/google2019-http
 ```
 
 В `screen` нажать **Ctrl+A, затем D**, чтобы оставить процесс работать.

@@ -275,6 +275,26 @@ def source_columns(phase,table,cfg):
     return None
 
 
+def filtered_data_sql(table,cfg):
+    """Shared deterministic per-source filter for the main and auxiliary downloader."""
+    if table=='instance_usage':
+        return ('SELECT i.*,average_usage.cpus AS cpu,average_usage.memory AS mem '
+                'FROM incoming i SEMI JOIN candidates c USING(collection_id,instance_index) '
+                'WHERE '+usage_where(cfg['t0'],cfg['t1']))
+    if table=='instance_events':
+        return ('SELECT i.*,resource_request.cpus AS cpu_request,'
+                'resource_request.memory AS mem_request FROM incoming i '
+                'SEMI JOIN candidates c USING(collection_id,instance_index) '
+                f'WHERE time < {cfg["t1"]}')
+    if table=='collection_events':
+        return ('SELECT i.* FROM incoming i SEMI JOIN '
+                '(SELECT DISTINCT collection_id FROM candidates) c USING(collection_id) '
+                f'WHERE time < {cfg["t1"]}')
+    if table in ('machine_events','machine_attributes'):
+        return f'SELECT * FROM incoming WHERE time < {cfg["t1"]}'
+    raise Paused(f'Unknown source table: {table}')
+
+
 @contextlib.contextmanager
 def prefetch_downloads(work,output,cfg,jobs):
     """Bound in-flight + ready files, keeping one ordered DuckDB consumer.
@@ -370,22 +390,7 @@ def ingest(work, output, cfg, sources, phase):
                                    + usage_where(cfg['t0'], end, prefix=True))
                             db.execute('INSERT INTO prefix '+sql)
                         else:
-                            if table == 'instance_usage':
-                                sql = ('SELECT i.*, average_usage.cpus AS cpu, average_usage.memory AS mem '
-                                       'FROM incoming i SEMI JOIN candidates c USING(collection_id,instance_index) '
-                                       'WHERE '+usage_where(cfg['t0'], cfg['t1']))
-                            elif table == 'instance_events':
-                                sql = ('SELECT i.*,resource_request.cpus AS cpu_request,'
-                                       'resource_request.memory AS mem_request FROM incoming i '
-                                       'SEMI JOIN candidates c USING(collection_id,instance_index) '
-                                       f'WHERE time < {cfg["t1"]}')
-                            elif table == 'collection_events':
-                                sql = ('SELECT i.* FROM incoming i SEMI JOIN '
-                                       '(SELECT DISTINCT collection_id FROM candidates) c USING(collection_id) '
-                                       f'WHERE time < {cfg["t1"]}')
-                            else:
-                                # Host lifecycle/capacity history for the entire cell is small and useful.
-                                sql = f'SELECT * FROM incoming WHERE time < {cfg["t1"]}'
+                            sql = filtered_data_sql(table,cfg)
                             db.execute(f'CREATE TABLE IF NOT EXISTS {table} AS {sql} LIMIT 0')
                             db.execute(f'INSERT INTO {table} {sql}')
                         count += batch.num_rows
@@ -686,12 +691,12 @@ def worker(work, output, cfg, sources):
     export(work,output,cfg,sources)
 
 
-def supervise(work, output, cfg, lock_fds=()):
+def supervise(work, output, cfg, lock_fds=(),command=None,resource_guard=None):
     import psutil
     env = dict(os.environ, OPENBLAS_NUM_THREADS='1', OMP_NUM_THREADS='1',
                MKL_NUM_THREADS='1', ARROW_NUM_THREADS='1',
                VMFORECAST_SUPERVISOR_PID=str(os.getpid()))
-    cmd = [sys.executable,str(Path(__file__).resolve()),'_worker','--work',str(work)]
+    cmd = command or [sys.executable,str(Path(__file__).resolve()),'_worker','--work',str(work)]
     process = subprocess.Popen(cmd,env=env,start_new_session=True,pass_fds=lock_fds)
     child = psutil.Process(process.pid)
     reason = None
@@ -704,7 +709,10 @@ def supervise(work, output, cfg, lock_fds=()):
                     raise Paused('Worker RSS limit reached; checkpoint preserved; lower --batch-rows/threads')
                 if psutil.virtual_memory().available < 256*MIB:
                     raise Paused('System available RAM below 256 MiB; checkpoint preserved')
-                guard(work,output,cfg)
+                if resource_guard is None:
+                    guard(work,output,cfg)
+                else:
+                    resource_guard()
             except psutil.NoSuchProcess:
                 break
             except Paused as exc:
