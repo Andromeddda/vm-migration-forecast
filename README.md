@@ -152,3 +152,22 @@ sh lab audit
 - [Прочитать правила проекта](docs/HANDBOOK.md)
 - [Посмотреть архитектуру](docs/ARCHITECTURE.md)
 - [Посмотреть результаты проверок](docs/VALIDATION.md)
+
+## Запустить команду в фоне с перезапуском
+
+```sh
+sudo apt install screen
+loginctl enable-linger "$USER"
+./tools/watchdog.sh --name my-job -- /path/to/program argument
+./tools/watchdog.sh status my-job
+./tools/watchdog.sh attach my-job
+```
+
+Отсоединиться от screen: **Ctrl+A, затем D**.
+
+```sh
+./tools/watchdog.sh stop my-job
+./tools/watchdog.sh restart my-job
+```
+
+- [Настроить надзор, лимит памяти и проверить перезапуск](docs/WATCHDOG.md)
