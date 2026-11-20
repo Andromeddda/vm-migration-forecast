@@ -1,0 +1,560 @@
+"""Exercise real HTTP Range, Parquet decoding, transactions, packing, and backtest handoff."""
+import http.server
+import importlib.util
+import json
+from pathlib import Path
+import threading
+
+import pytest
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+pytest.importorskip('duckdb')
+spec = importlib.util.spec_from_file_location('http_extract',
+    Path(__file__).parents[1]/'src/vmforecast/google2019_http.py')
+h = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(h)
+
+
+@pytest.fixture
+def trace(tmp_path):
+    source, work, output = [tmp_path/x for x in ('source','work','output')]
+    for x in (source,work,output):
+        x.mkdir()
+    t0, t1 = 600_000_000,600_000_000+3*3600_000_000
+    usage = []
+    for cid in (1,2,3):
+        for k in range(36):
+            # Object 2 has a future gap; must not disappear silently from raw data.
+            if cid==2 and k==20:
+                continue
+            usage.append(dict(start_time=t0+k*h.STEP,end_time=t0+(k+1)*h.STEP,
+                collection_id=cid,instance_index=0,machine_id=100,collection_type=0,
+                alloc_collection_id=0,average_usage={'cpus':.1,'memory':.2},
+                maximum_usage={'cpus':.3,'memory':.4},sample_rate=1.,
+                cpu_usage_distribution=[.01,.1,.3]))
+    events = [dict(time=0,type=3,collection_id=c,instance_index=0,machine_id=100,
+                   missing_type=0,resource_request={'cpus':.3,'memory':.4}) for c in (1,2,3)]
+    # Instance 3 restarts after the prefix: not strict-backtest valid.
+    events.append(dict(events[-1],time=t0+2*3600_000_000,type=5))
+    tables = {'instance_usage':usage,'instance_events':events,
+        'machine_events':[dict(time=0,type=0,machine_id=100,capacity={'cpus':1.,'memory':1.})],
+        'machine_attributes':[dict(time=0,machine_id=100,name='platform',value='x',deleted=False)],
+        'collection_events':[dict(time=0,type=0,collection_id=c) for c in (1,2,3)]}
+    files = []
+    for table, rows in tables.items():
+        chunks = [rows[::2],rows[1::2]] if table=='instance_usage' else [rows]
+        for i, chunk in enumerate(chunks):
+            name = f'{table}-{i:012d}.parquet.gz'
+            pq.write_table(pa.Table.from_pylist(chunk),source/name,row_group_size=11,compression='snappy')
+            files.append(dict(name=name,table=table,size=(source/name).stat().st_size))
+    requests = []
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            assert 'Authorization' not in self.headers
+            path = source/self.path.split('?')[0].lstrip('/')
+            data = path.read_bytes()
+            start,end = map(int,self.headers['Range'].split('=')[1].split('-'))
+            requests.append((path.name,start,end))
+            self.send_response(206)
+            self.send_header('Content-Range',f'bytes {start}-{end}/{len(data)}')
+            self.send_header('Content-Length',str(end-start+1))
+            self.end_headers()
+            self.wfile.write(data[start:end+1])
+        def log_message(self,*args):
+            pass
+    server = http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+    thread = threading.Thread(target=server.serve_forever,daemon=True)
+    thread.start()
+    for obj in files:
+        obj['url']=f'http://127.0.0.1:{server.server_port}/{obj["name"]}'
+    cfg = dict(t0=t0,t1=t1,prefix_hours=1,days=3/24,cell='a',seed=7,max_objects=3,
+        max_shard_mib=128,batch_rows=7,retry_hours=0,columns='research',memory_mib=128,
+        rss_mib=1024,threads=1,spill_gb=1,reserve_gb=1,stage_gb=2,disk_gb=100,
+        target_gb=.1,output=str(output),work=str(work))
+    yield work,output,cfg,files,requests
+    server.shutdown()
+    thread.join()
+    server.server_close()
+
+
+def test_http_pipeline_resume_and_backtest(trace,tmp_path):
+    work,out,cfg,files,requests = trace
+    h.worker(work,out,cfg,files)
+    manifest = json.loads((out/'manifest.json').read_text())
+    assert manifest['instances']==3
+    assert manifest['full_window_backtest_valid_instances']==1
+    assert manifest['source_row_counts']['instance_usage']==107
+    assert h.tree_bytes(out)<cfg['target_gb']*h.GB
+    q = pq.read_table(out/'quality.parquet').to_pandas().set_index('collection_id')
+    assert q.loc[1,'valid']
+    assert not q.loc[2,'continuous']
+    assert not q.loc[3,'lifecycle_ok']
+    usage = pq.read_table(out/'usage.parquet'/'1_0.parquet')
+    assert usage.num_rows==36
+    assert 'maximum_usage' in usage.column_names
+    assert usage['cpu'].to_pylist()==[.1]*36
+    hashes = {p.relative_to(out):h.checksum(p) for p in out.rglob('*.parquet') if p.is_file()}
+    count = len(requests)
+    h.worker(work,out,cfg,files)
+    assert len(requests)==count  # Successful shards are never downloaded twice.
+    assert hashes=={p.relative_to(out):h.checksum(p) for p in out.rglob('*.parquet') if p.is_file()}
+    h.prepare(out,tmp_path/'prepared',objects=3,hours=3)
+    from vmforecast.data import load_workload
+    from vmforecast import WindowSignal,SimulationConfig
+    from vmforecast.experiments import run_saved
+    workload = load_workload(tmp_path/'prepared')
+    assert workload.demand.shape==(36,1,2)
+    summary,_ = run_saved(workload,WindowSignal(window=4,mode='max'),
+                         SimulationConfig(warmup=12),tmp_path/'runs')
+    assert summary
+
+
+def test_sparse_projection_and_changed_outputs(trace):
+    work,out,cfg,files,requests = trace
+    obj = next(x for x in files if x['table']=='instance_usage')
+    path = work/'sparse.parquet'
+    rows,transferred = h.fetch_sparse(obj,path,h.PREFIX_COLUMNS,cfg)
+    r = pq.ParquetFile(path)
+    batches = list(r.iter_batches(columns=h.PREFIX_COLUMNS,use_threads=False))
+    assert sum(b.num_rows for b in batches)==rows
+    assert 'maximum_usage' not in batches[0].schema.names
+    r.close()
+    path.unlink()
+    h.worker(work,out,cfg,files)
+    (out/'usage.parquet'/'1_0.parquet').write_bytes(b'corrupt')
+    with pytest.raises(h.Paused,match='damaged'):
+        h.export(work,out,cfg,files)
+
+
+def test_core_projection_is_readable(trace):
+    work,out,cfg,files,_ = trace
+    cfg['columns']='core'
+    h.worker(work,out,cfg,files)
+    usage = pq.read_table(out/'usage.parquet'/'1_0.parquet')
+    assert usage.num_rows==36
+    assert 'maximum_usage' not in usage.column_names
+    assert 'cpu' in usage.column_names
+    events = pq.read_table(out/'events.parquet'/'1_0.parquet')
+    assert events['cpu_request'].to_pylist()==[.3]
+
+
+def test_standalone_cli_supervised_end_to_end(trace):
+    import subprocess
+    import sys
+    work,out,cfg,files,_ = trace
+    h.atomic_json(work/'sources.json',files)
+    script = Path(__file__).parents[1]/'tools/download_google2019.py'
+    cmd = [sys.executable,str(script),'download','--work',str(work),'--output',str(out),
+           '--days','0.125','--max-objects','3','--target-gb','0.1',
+           '--reserve-gb','1','--memory-mib','128','--rss-mib','1024',
+           '--threads','1','--batch-rows','7']
+    result = subprocess.run(cmd,capture_output=True,text=True,timeout=60)
+    assert result.returncode==0,result.stdout+result.stderr
+    assert json.loads((out/'manifest.json').read_text())['instances']==3
+    assert not (work/'stage.duckdb').exists()  # Space released only after checksum verification.
+    # Resume through the CLI too, not just helper functions.
+    result = subprocess.run(cmd,capture_output=True,text=True,timeout=60)
+    assert result.returncode==0,result.stdout+result.stderr
+    assert not (work/'stage.duckdb').exists()
+
+
+def test_interruption_rolls_back_whole_shard(trace,monkeypatch):
+    work,out,cfg,files,requests = trace
+    original = h.fetch_sparse
+    calls = 0
+    def fail(*args,**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls==2:
+            raise h.Paused('simulated interruption')
+        return original(*args,**kwargs)
+    monkeypatch.setattr(h,'fetch_sparse',fail)
+    with pytest.raises(h.Paused):
+        h.ingest(work,out,cfg,files,'prefix')
+    # Close/recover the persistent DB after failure; only the first shard is committed.
+    monkeypatch.setattr(h,'fetch_sparse',original)
+    h.worker(work,out,cfg,files)
+    assert json.loads((out/'manifest.json').read_text())['instances']==3
+
+
+def test_exact_pair_budget_and_low_disk(trace,monkeypatch):
+    work,out,cfg,files,requests = trace
+    h.ingest(work,out,cfg,files,'prefix')
+    h.ingest(work,out,cfg,files,'data')
+    h.export(work,out,cfg,files)
+    # A second independent export, fitted to one complete instance pair + metadata.
+    import shutil
+    import duckdb
+    rows = pq.read_table(out/'checksums.parquet').to_pylist()
+    base = sum((out/(t+'.parquet')).stat().st_size for t in
+               ('machine_events','machine_attributes','collection_events'))
+    cap = 16*h.MIB+base+max(x['bytes'] for x in rows)
+    shutil.rmtree(out)
+    out.mkdir()
+    db = h.connect_db(work,cfg)
+    db.execute('DELETE FROM exported')
+    db.close()
+    cfg['target_gb']=cap/h.GB
+    h.export(work,out,cfg,files)
+    manifest = json.loads((out/'manifest.json').read_text())
+    assert manifest['instances']==1
+    assert h.tree_bytes(out)<=cap
+    assert len(list((out/'usage.parquet').glob('*.parquet')))==1
+    assert len(list((out/'events.parquet').glob('*.parquet')))==1
+    usage = shutil.disk_usage(work)
+    monkeypatch.setattr(h.shutil,'disk_usage',lambda _:usage._replace(free=0))
+    with pytest.raises(h.Paused,match='Low filesystem'):
+        h.guard(work,out,cfg)
+
+
+def test_http_does_not_accept_ignored_range(monkeypatch):
+    import io
+    class Response(io.BytesIO):
+        status=200
+        headers={}
+    monkeypatch.setattr(h.urllib.request,'urlopen',lambda *a,**k:Response(b'full file'))
+    with pytest.raises(h.Paused,match='ignored'):
+        h.get_bytes('http://example.invalid/file',expected=8,start=0,retry_hours=0)
+
+
+def test_retry_incomplete_http_response(monkeypatch):
+    import io
+    import http.client
+    calls=[]
+    class Response(io.BytesIO):
+        status=206
+        headers={'Content-Range':'bytes 0-7/10'}
+    def urlopen(*args,**kwargs):
+        calls.append(1)
+        if len(calls)==1:
+            raise http.client.IncompleteRead(b'ab',8)
+        return Response(b'abcdefgh')
+    monkeypatch.setattr(h.urllib.request,'urlopen',urlopen)
+    monkeypatch.setattr(h.time,'sleep',lambda _:None)
+    assert h.get_bytes('http://example.invalid/file',expected=8,start=0,retry_hours=.01)==b'abcdefgh'
+    assert len(calls)==2
+
+
+def test_publish_across_filesystems(tmp_path,monkeypatch):
+    import errno
+    src,dst=tmp_path/'source',tmp_path/'destination'
+    src.write_bytes(b'complete data')
+    replace=Path.replace
+    def cross_device(self,target):
+        if self==src:
+            raise OSError(errno.EXDEV,'cross-device')
+        return replace(self,target)
+    monkeypatch.setattr(Path,'replace',cross_device)
+    h.publish(src,dst)
+    assert dst.read_bytes()==b'complete data'
+    assert not src.exists()
+    assert not (tmp_path/'destination.partial').exists()
+
+
+def test_interrupted_pair_publication_recovers(trace,monkeypatch):
+    work,out,cfg,files,_=trace
+    h.ingest(work,out,cfg,files,'prefix')
+    h.ingest(work,out,cfg,files,'data')
+    original=h.publish
+    def fail_between_pair(source,destination):
+        if destination.parent.name=='events.parquet':
+            raise h.Paused('interrupted between usage and events publication')
+        return original(source,destination)
+    monkeypatch.setattr(h,'publish',fail_between_pair)
+    with pytest.raises(h.Paused):
+        h.export(work,out,cfg,files)
+    assert not (out/'manifest.json').exists()
+    monkeypatch.setattr(h,'publish',original)
+    h.export(work,out,cfg,files)
+    assert h.verify_dataset(out)['instances']==3
+
+
+def test_worker_ram_ceiling_terminates_child(tmp_path,monkeypatch):
+    import psutil
+    class FakeChild:
+        def memory_info(self):
+            return type('Mem',(),{'rss':2*h.MIB})()
+        def children(self,recursive=False):
+            return []
+    class Process:
+        pid=123456
+        done=False
+        def poll(self):
+            return -15 if self.done else None
+        def wait(self,timeout=None):
+            self.done=True
+            return -15
+    killed=[]
+    monkeypatch.setattr(h.subprocess,'Popen',lambda *a,**k:Process())
+    monkeypatch.setattr(psutil,'Process',lambda _:FakeChild())
+    monkeypatch.setattr(h.os,'killpg',lambda *a:killed.append(a))
+    monkeypatch.setattr(h.time,'sleep',lambda _:None)
+    with pytest.raises(h.Paused,match='RSS'):
+        h.supervise(tmp_path,tmp_path,{'rss_mib':1})
+    assert killed==[(123456,h.signal.SIGTERM)]
+
+
+def test_prefetch_is_parallel_bounded_and_ordered(trace,monkeypatch):
+    work,out,cfg,_,_=trace
+    cfg.update(network_workers=2,prefetch_shards=2)
+    second_started,third_finished=threading.Event(),threading.Event()
+    lock=threading.Lock()
+    active,maximum=0,0
+    called=[]
+    paths=[]
+    def fake_fetch(obj,path,columns,download_cfg):
+        nonlocal active,maximum
+        with lock:
+            active+=1
+            maximum=max(maximum,active)
+            called.append(obj['number'])
+            paths.append(path)
+        try:
+            if obj['number']==1:
+                assert second_started.wait(5),'Second network thread did not overlap the first'
+            elif obj['number']==2:
+                second_started.set()
+            path.write_bytes(b'downloaded')
+            if obj['number']==3:
+                third_finished.set()
+            return 1,10
+        finally:
+            with lock:
+                active-=1
+    monkeypatch.setattr(h,'fetch_sparse',fake_fetch)
+    jobs=[(i,{'number':i},None) for i in range(1,7)]
+    with h.prefetch_downloads(work,out,cfg,jobs) as stream:
+        first=next(stream)
+        assert first[0]==1
+        # While the consumer owns shard 1, the network finishes successors 2 and 3.
+        assert third_finished.wait(5),'No download overlapped the processing slot'
+        assert sorted(called)==[1,2,3]
+        assert len(list((work/'http-prefetch').glob('*')))==3
+        assert len(set(paths))==3
+        assert [first[0]]+[row[0] for row in stream]==list(range(1,7))
+    assert maximum==2
+    assert not (work/'http-prefetch').exists()
+
+
+def test_zero_prefetch_disables_overlap(trace,monkeypatch):
+    work,out,cfg,_,_=trace
+    cfg.update(network_workers=2,prefetch_shards=0)
+    called=[]
+    def fetch(obj,path,columns,download_cfg):
+        called.append(obj)
+        path.write_bytes(b'x')
+        return 1,1
+    monkeypatch.setattr(h,'fetch_sparse',fetch)
+    with h.prefetch_downloads(work,out,cfg,[(i,i,None) for i in range(3)]) as stream:
+        first=next(stream)
+        assert called==[0]
+        assert [first[0]]+[x[0] for x in stream]==[0,1,2]
+    assert not (work/'http-prefetch').exists()
+
+
+def test_prefetch_cancellation_interrupts_retry_wait(trace,monkeypatch):
+    work,out,cfg,_,_=trace
+    cfg.update(network_workers=2,prefetch_shards=1)
+    waiting=threading.Event()
+    cancelled=threading.Event()
+    def fetch(obj,path,columns,download_cfg):
+        if obj==1:
+            waiting.set()
+            assert download_cfg['_download_stop'].wait(5)
+            cancelled.set()
+            raise h.Paused('download cancelled')
+        path.write_bytes(b'x')
+        return 1,1
+    monkeypatch.setattr(h,'fetch_sparse',fetch)
+    with h.prefetch_downloads(work,out,cfg,[(i,i,None) for i in range(2)]) as stream:
+        assert next(stream)[0]==0
+        assert waiting.wait(5)
+        # Exit without consuming the successor: its retry wait must be interrupted.
+    assert cancelled.is_set()
+    assert not (work/'http-prefetch').exists()
+
+
+def test_processing_failure_rolls_back_despite_finished_prefetch(trace,monkeypatch):
+    work,out,cfg,files,_=trace
+    connect=h.connect_db
+    calls=0
+    owner=threading.get_ident()
+    class FailingWriter:
+        def __init__(self,db):
+            self.db=db
+        def __getattr__(self,name):
+            return getattr(self.db,name)
+        def execute(self,sql,*args):
+            nonlocal calls
+            assert threading.get_ident()==owner,'A download thread touched DuckDB'
+            if sql.startswith('INSERT INTO prefix '):
+                calls+=1
+                if calls==2:
+                    raise RuntimeError('simulated mid-shard processing failure')
+            return self.db.execute(sql,*args)
+    monkeypatch.setattr(h,'connect_db',lambda *a,**kw:FailingWriter(connect(*a,**kw)))
+    with pytest.raises(RuntimeError,match='mid-shard'):
+        h.ingest(work,out,cfg,files,'prefix')
+    db=connect(work,cfg)
+    assert db.execute('SELECT count(*) FROM done').fetchone()[0]==0
+    assert db.execute('SELECT count(*) FROM prefix').fetchone()[0]==0
+    db.close()
+    assert not (work/'http-prefetch').exists()
+    monkeypatch.setattr(h,'connect_db',connect)
+    h.ingest(work,out,cfg,files,'prefix')
+    db=connect(work,cfg)
+    assert db.execute('SELECT count(*) FROM prefix').fetchone()[0]==36
+    db.close()
+
+
+def test_v1_checkpoint_and_config_resume_through_cli(trace,monkeypatch):
+    import subprocess
+    import sys
+    work,out,cfg,files,requests=trace
+    script=Path(__file__).parents[1]/'tools/download_google2019.py'
+    argv=['download','--work',str(work),'--output',str(out),'--days','0.125',
+          '--max-objects','3','--target-gb','0.1','--reserve-gb','1',
+          '--memory-mib','128','--rss-mib','1024','--threads','1','--batch-rows','7','--keep-stage']
+    old_cfg=vars(h.parser().parse_args(argv)).copy()
+    for key in ('command','network_workers','prefetch_shards'):
+        old_cfg.pop(key)
+    old_cfg.update(work=str(work.resolve()),output=str(out.resolve()),format_version=1,
+                   t1=old_cfg['t0']+int(old_cfg['days']*24*3600_000_000))
+    h.atomic_json(work/'config.json',old_cfg)
+    h.atomic_json(work/'sources.json',files)
+    # Exact v1 schemas/checkpoint semantics; neither prefetch nor new config keys exist.
+    first=next(x for x in files if x['table']=='instance_usage')
+    cache=work/'source.partial.parquet'
+    rows,network=h.fetch_sparse(first,cache,h.PREFIX_COLUMNS,cfg)
+    db=h.connect_db(work,cfg)
+    db.execute('CREATE TABLE done(phase VARCHAR,name VARCHAR,rows BIGINT,network_bytes BIGINT,'
+               'PRIMARY KEY(phase,name))')
+    db.execute('CREATE TABLE prefix(collection_id BIGINT,instance_index BIGINT,a BIGINT,b BIGINT)')
+    reader=pq.ParquetFile(cache)
+    for batch in reader.iter_batches(columns=h.PREFIX_COLUMNS,use_threads=False):
+        db.register('incoming',batch)
+        end=cfg['t0']+3600_000_000
+        db.execute('INSERT INTO prefix SELECT collection_id,instance_index,'
+                   f'greatest(start_time,{cfg["t0"]}),least(end_time,{end}) FROM incoming WHERE '
+                   +h.usage_where(cfg['t0'],end,prefix=True))
+        db.unregister('incoming')
+    db.execute('INSERT INTO done VALUES (?,?,?,?)',['prefix',first['name'],rows,network])
+    db.execute('CHECKPOINT')
+    db.close()
+    reader.close()
+    # Restart only prefix first: the previously committed shard must not make HTTP requests.
+    fetched=[]
+    original=h.fetch_sparse
+    def record(obj,*a,**kw):
+        fetched.append(obj['name'])
+        return original(obj,*a,**kw)
+    monkeypatch.setattr(h,'fetch_sparse',record)
+    h.ingest(work,out,cfg,files,'prefix')
+    assert first['name'] not in fetched
+    assert len(fetched)==1
+    # Old JSON still lacks new keys; CLI must migrate operational settings, finish, and verify.
+    result=subprocess.run([sys.executable,str(script),*argv,'--network-workers','2',
+                           '--prefetch-shards','2'],capture_output=True,text=True,timeout=60)
+    assert result.returncode==0,result.stdout+result.stderr
+    new_cfg=json.loads((work/'config.json').read_text())
+    assert new_cfg['network_workers']==2 and new_cfg['prefetch_shards']==2
+    db=h.connect_db(work,new_cfg)
+    assert db.execute('SELECT count(*) FROM prefix').fetchone()[0]==36
+    assert db.execute('SELECT rows,network_bytes FROM done WHERE phase=? AND name=?',
+                      ['prefix',first['name']]).fetchone()==(rows,network)
+    assert db.execute("SELECT count(*) FROM done WHERE phase='prefix'").fetchone()[0]==2
+    db.close()
+    assert h.verify_dataset(out)['instances']==3
+
+
+def test_parallel_and_sequential_outputs_are_identical(trace):
+    work,out,cfg,files,_=trace
+    cfg.update(network_workers=2,prefetch_shards=2)
+    h.worker(work,out,cfg,files)
+    seq_work,seq_out=work.parent/'sequential-work',out.parent/'sequential-output'
+    seq_work.mkdir()
+    seq_out.mkdir()
+    sequential=dict(cfg,network_workers=1,prefetch_shards=0,
+                    work=str(seq_work),output=str(seq_out))
+    h.worker(seq_work,seq_out,sequential,files)
+    for path in out.rglob('*.parquet'):
+        if path.is_file():
+            assert pq.read_table(path).equals(pq.read_table(seq_out/path.relative_to(out)))
+
+
+def old_cohort_sql(cfg):
+    """Original cb04717 query, retained as a small-data correctness oracle."""
+    end=cfg['t0']+cfg['prefix_hours']*3600_000_000
+    return f'''WITH ordered AS (SELECT *,max(b) OVER(PARTITION BY collection_id,instance_index
+        ORDER BY a,b ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) prev FROM prefix),
+        eligible AS (SELECT collection_id,instance_index FROM ordered GROUP BY ALL
+        HAVING sum(b-a)={end-cfg['t0']} AND min(a)={cfg['t0']} AND max(b)={end}
+        AND count(*) FILTER(WHERE a<prev)=0)
+        SELECT *,row_number() OVER(ORDER BY md5(collection_id::VARCHAR||':'||
+        instance_index::VARCHAR||':{cfg['seed']}'),collection_id,instance_index) rank
+        FROM eligible ORDER BY rank LIMIT {cfg['max_objects']}'''
+
+
+@pytest.mark.parametrize('seed',[0,7,-3])
+def test_streamed_cohort_matches_original_selection(trace,seed):
+    work,out,cfg,_,_=trace
+    cfg.update(seed=seed,max_objects=7,batch_rows=3)
+    db=h.connect_db(work,cfg)
+    db.execute('CREATE TABLE prefix(collection_id BIGINT,instance_index BIGINT,a BIGINT,b BIGINT)')
+    t0=cfg['t0'];d=3600_000_000
+    intervals=[]
+    for cid in range(40):
+        for idx in (0,1):
+            intervals.extend([(cid,idx,t0,t0+d//2),(cid,idx,t0+d//2,t0+d)])
+    # Invalid histories, including an overlap + gap whose total duration still matches.
+    intervals.extend([(100,0,t0,t0+d//2),(100,0,t0+d//4,t0+d//2),
+                      (100,0,t0+3*d//4,t0+d)])
+    intervals.extend([(101,0,t0,t0+d),(101,0,t0,t0+d)])
+    intervals.extend([(102,0,t0+1,t0+d)])
+    intervals.extend([(103,0,t0,t0+d-1)])
+    db.executemany('INSERT INTO prefix VALUES (?,?,?,?)',list(reversed(intervals)))
+    reference=db.execute(old_cohort_sql(cfg)).fetchall()
+    h.select_candidates(work,out,cfg,db)
+    assert db.execute('SELECT * FROM candidates ORDER BY rank').fetchall()==reference
+    db.close()
+
+
+def test_failed_selection_resumes_completed_prefix_without_network(trace,monkeypatch):
+    work,out,cfg,files,_=trace
+    digest=h.hashlib.md5
+    def fail(*args,**kwargs):
+        raise MemoryError('simulated interruption during candidate selection')
+    monkeypatch.setattr(h.hashlib,'md5',fail)
+    with pytest.raises(MemoryError):
+        h.ingest(work,out,cfg,files,'prefix')
+    db=h.connect_db(work,cfg)
+    completed=db.execute('SELECT * FROM done ORDER BY phase,name').fetchall()
+    assert len(completed)==2
+    assert db.execute('SELECT count(*) FROM prefix').fetchone()[0]==36
+    assert not db.execute("SELECT 1 FROM information_schema.tables WHERE table_name='candidates'").fetchone()
+    db.close()
+    monkeypatch.setattr(h.hashlib,'md5',digest)
+    def no_network(*args,**kwargs):
+        pytest.fail('Completed prefix must not be downloaded again')
+    monkeypatch.setattr(h,'fetch_sparse',no_network)
+    h.ingest(work,out,cfg,files,'prefix')
+    db=h.connect_db(work,cfg)
+    assert db.execute('SELECT * FROM done ORDER BY phase,name').fetchall()==completed
+    assert db.execute('SELECT count(*) FROM candidates').fetchone()[0]==3
+    db.close()
+
+
+def test_cohort_large_prefix_under_128_mib(trace):
+    work,out,cfg,_,_=trace
+    cfg.update(memory_mib=128,max_objects=25000,batch_rows=16384)
+    db=h.connect_db(work,cfg)
+    db.execute(f'''CREATE TABLE prefix AS SELECT cid::BIGINT collection_id,0::BIGINT instance_index,
+        ({cfg['t0']}+k*300000000)::BIGINT a,({cfg['t0']}+(k+1)*300000000)::BIGINT b
+        FROM range(200000) c(cid) CROSS JOIN range(12) t(k)''')
+    db.execute('CHECKPOINT')
+    h.select_candidates(work,out,cfg,db)
+    assert db.execute('SELECT count(*),count(DISTINCT collection_id),min(rank),max(rank) '
+                      'FROM candidates').fetchone()==(25000,25000,1,25000)
+    assert db.execute('SELECT count(*) FROM prefix').fetchone()[0]==2_400_000
+    db.close()
