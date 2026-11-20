@@ -481,3 +481,80 @@ def test_parallel_and_sequential_outputs_are_identical(trace):
     for path in out.rglob('*.parquet'):
         if path.is_file():
             assert pq.read_table(path).equals(pq.read_table(seq_out/path.relative_to(out)))
+
+
+def old_cohort_sql(cfg):
+    """Original cb04717 query, retained as a small-data correctness oracle."""
+    end=cfg['t0']+cfg['prefix_hours']*3600_000_000
+    return f'''WITH ordered AS (SELECT *,max(b) OVER(PARTITION BY collection_id,instance_index
+        ORDER BY a,b ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) prev FROM prefix),
+        eligible AS (SELECT collection_id,instance_index FROM ordered GROUP BY ALL
+        HAVING sum(b-a)={end-cfg['t0']} AND min(a)={cfg['t0']} AND max(b)={end}
+        AND count(*) FILTER(WHERE a<prev)=0)
+        SELECT *,row_number() OVER(ORDER BY md5(collection_id::VARCHAR||':'||
+        instance_index::VARCHAR||':{cfg['seed']}'),collection_id,instance_index) rank
+        FROM eligible ORDER BY rank LIMIT {cfg['max_objects']}'''
+
+
+@pytest.mark.parametrize('seed',[0,7,-3])
+def test_streamed_cohort_matches_original_selection(trace,seed):
+    work,out,cfg,_,_=trace
+    cfg.update(seed=seed,max_objects=7,batch_rows=3)
+    db=h.connect_db(work,cfg)
+    db.execute('CREATE TABLE prefix(collection_id BIGINT,instance_index BIGINT,a BIGINT,b BIGINT)')
+    t0=cfg['t0'];d=3600_000_000
+    intervals=[]
+    for cid in range(40):
+        for idx in (0,1):
+            intervals.extend([(cid,idx,t0,t0+d//2),(cid,idx,t0+d//2,t0+d)])
+    # Invalid histories, including an overlap + gap whose total duration still matches.
+    intervals.extend([(100,0,t0,t0+d//2),(100,0,t0+d//4,t0+d//2),
+                      (100,0,t0+3*d//4,t0+d)])
+    intervals.extend([(101,0,t0,t0+d),(101,0,t0,t0+d)])
+    intervals.extend([(102,0,t0+1,t0+d)])
+    intervals.extend([(103,0,t0,t0+d-1)])
+    db.executemany('INSERT INTO prefix VALUES (?,?,?,?)',list(reversed(intervals)))
+    reference=db.execute(old_cohort_sql(cfg)).fetchall()
+    h.select_candidates(work,out,cfg,db)
+    assert db.execute('SELECT * FROM candidates ORDER BY rank').fetchall()==reference
+    db.close()
+
+
+def test_failed_selection_resumes_completed_prefix_without_network(trace,monkeypatch):
+    work,out,cfg,files,_=trace
+    digest=h.hashlib.md5
+    def fail(*args,**kwargs):
+        raise MemoryError('simulated interruption during candidate selection')
+    monkeypatch.setattr(h.hashlib,'md5',fail)
+    with pytest.raises(MemoryError):
+        h.ingest(work,out,cfg,files,'prefix')
+    db=h.connect_db(work,cfg)
+    completed=db.execute('SELECT * FROM done ORDER BY phase,name').fetchall()
+    assert len(completed)==2
+    assert db.execute('SELECT count(*) FROM prefix').fetchone()[0]==36
+    assert not db.execute("SELECT 1 FROM information_schema.tables WHERE table_name='candidates'").fetchone()
+    db.close()
+    monkeypatch.setattr(h.hashlib,'md5',digest)
+    def no_network(*args,**kwargs):
+        pytest.fail('Completed prefix must not be downloaded again')
+    monkeypatch.setattr(h,'fetch_sparse',no_network)
+    h.ingest(work,out,cfg,files,'prefix')
+    db=h.connect_db(work,cfg)
+    assert db.execute('SELECT * FROM done ORDER BY phase,name').fetchall()==completed
+    assert db.execute('SELECT count(*) FROM candidates').fetchone()[0]==3
+    db.close()
+
+
+def test_cohort_large_prefix_under_128_mib(trace):
+    work,out,cfg,_,_=trace
+    cfg.update(memory_mib=128,max_objects=25000,batch_rows=16384)
+    db=h.connect_db(work,cfg)
+    db.execute(f'''CREATE TABLE prefix AS SELECT cid::BIGINT collection_id,0::BIGINT instance_index,
+        ({cfg['t0']}+k*300000000)::BIGINT a,({cfg['t0']}+(k+1)*300000000)::BIGINT b
+        FROM range(200000) c(cid) CROSS JOIN range(12) t(k)''')
+    db.execute('CHECKPOINT')
+    h.select_candidates(work,out,cfg,db)
+    assert db.execute('SELECT count(*),count(DISTINCT collection_id),min(rank),max(rank) '
+                      'FROM candidates').fetchone()==(25000,25000,1,25000)
+    assert db.execute('SELECT count(*) FROM prefix').fetchone()[0]==2_400_000
+    db.close()

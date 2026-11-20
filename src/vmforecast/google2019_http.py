@@ -13,6 +13,7 @@ import contextlib
 import errno
 import fcntl
 import hashlib
+import heapq
 import http.client
 import json
 import logging
@@ -355,6 +356,106 @@ def prefetch_downloads(work,output,cfg,jobs):
         shutil.rmtree(cache_dir,ignore_errors=True)
 
 
+def select_candidates(work,output,cfg,db):
+    """One spillable ORDER BY; validate streams and retain only the best K keys.
+
+    Combining WINDOW + GROUP BY + ranking over the entire prefix can exhaust
+    DuckDB's pool even with spilling enabled. The heap is O(max_objects), and
+    the only full-prefix blocking operator remaining is the external sort.
+    Existing prefix/done tables are never modified here.
+    """
+    if db.execute("SELECT 1 FROM information_schema.tables WHERE table_name='candidates'").fetchone():
+        n=db.execute('SELECT count(*) FROM candidates').fetchone()[0]
+        if n:
+            LOG.info('Cohort already committed: %d instances; selection skipped',n)
+            return
+        # A prior empty selection has no downstream data to preserve. Rebuild atomically below.
+    import pyarrow as pa
+    t0=cfg['t0']
+    end=t0+cfg['prefix_hours']*3600_000_000
+    duration=end-t0
+    heap=[]
+    current=None
+    first=None
+    previous_end=None
+    covered=0
+    overlap=False
+    eligible=0
+    scanned=0
+    started=time.monotonic()
+
+    def retain(key):
+        nonlocal eligible
+        if first!=t0 or previous_end!=end or covered!=duration or overlap:
+            return
+        eligible+=1
+        cid,idx=key
+        digest=hashlib.md5(f'{cid}:{idx}:{cfg["seed"]}'.encode(),usedforsecurity=False).digest()
+        # Negative values make a min-heap whose root is the WORST retained key.
+        # Numeric digest order equals the old SQL's hexadecimal MD5 string order.
+        item=(-int.from_bytes(digest,'big'),-cid,-idx)
+        if len(heap)<cfg['max_objects']:
+            heapq.heappush(heap,item)
+        elif item>heap[0]:
+            heapq.heapreplace(heap,item)
+
+    guard(work,output,cfg)
+    LOG.info('Cohort selection: external prefix sort; heap <= %d; DuckDB memory=%dMiB',
+             cfg['max_objects'],cfg['memory_mib'])
+    # Use a relation's Arrow stream, not an execute() result materialized on the client.
+    relation=db.sql('SELECT collection_id,instance_index,a,b FROM prefix '
+                    'ORDER BY collection_id,instance_index,a,b')
+    reader=relation.fetch_record_batch(cfg['batch_rows'])
+    last_report=started
+    try:
+        for batch in reader:
+            for cid,idx,a,b in zip(*(column.to_pylist() for column in batch.columns)):
+                key=(cid,idx)
+                if key!=current:
+                    if current is not None:
+                        retain(current)
+                    current=key
+                    first=a
+                    previous_end=None
+                    covered=0
+                    overlap=False
+                # Match the previous SQL's max(b) over all preceding rows, not just LAG(b).
+                if previous_end is not None and a<previous_end:
+                    overlap=True
+                previous_end=b if previous_end is None else max(previous_end,b)
+                covered+=b-a
+            scanned+=batch.num_rows
+            if time.monotonic()-last_report>=10:
+                guard(work,output,cfg)
+                LOG.info('Cohort selection: prefix_rows=%d eligible=%d retained=%d elapsed=%.1fs',
+                         scanned,eligible,len(heap),time.monotonic()-started)
+                last_report=time.monotonic()
+        if current is not None:
+            retain(current)
+    finally:
+        reader.close()
+    if not heap:
+        raise Paused('No prefix-complete instances: inspect source/window configuration')
+    chosen=sorted(heap,reverse=True)
+    table=pa.table({'collection_id':pa.array([-x[1] for x in chosen],type=pa.int64()),
+                    'instance_index':pa.array([-x[2] for x in chosen],type=pa.int64()),
+                    'rank':pa.array(range(1,len(chosen)+1),type=pa.int64())})
+    db.register('chosen_prefix_candidates',table)
+    db.execute('BEGIN')
+    try:
+        db.execute('CREATE OR REPLACE TABLE candidates AS SELECT * FROM chosen_prefix_candidates')
+        db.execute('COMMIT')
+        db.execute('CHECKPOINT')
+    except BaseException:
+        with contextlib.suppress(Exception):
+            db.execute('ROLLBACK')
+        raise
+    finally:
+        db.unregister('chosen_prefix_candidates')
+    LOG.info('Selected %d of %d prefix-complete instances; scanned=%d elapsed=%.1fs',
+             len(chosen),eligible,scanned,time.monotonic()-started)
+
+
 def ingest(work, output, cfg, sources, phase):
     import pyarrow.parquet as pq
     db = connect_db(work, cfg)
@@ -418,21 +519,11 @@ def ingest(work, output, cfg, sources, phase):
         db.close()
         raise
     if phase == 'prefix':
-        # Reject gaps/overlaps in the initial observable prefix. Selection uses no future usage.
-        end = cfg['t0']+cfg['prefix_hours']*3600_000_000
-        db.execute(f'''CREATE TABLE IF NOT EXISTS candidates AS
-            WITH ordered AS (SELECT *,max(b) OVER(PARTITION BY collection_id,instance_index
-                ORDER BY a,b ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) prev FROM prefix),
-            eligible AS (SELECT collection_id,instance_index FROM ordered GROUP BY ALL
-                HAVING sum(b-a)={end-cfg['t0']} AND min(a)={cfg['t0']} AND max(b)={end}
-                AND count(*) FILTER(WHERE a<prev)=0)
-            SELECT *,row_number() OVER(ORDER BY md5(collection_id::VARCHAR||':'||
-                instance_index::VARCHAR||':{cfg['seed']}'),collection_id,instance_index) rank
-            FROM eligible ORDER BY rank LIMIT {cfg['max_objects']}''')
-        n = db.execute('SELECT count(*) FROM candidates').fetchone()[0]
-        if not n:
-            raise Paused('No prefix-complete instances: inspect source/window configuration')
-        LOG.info('Selected %d prefix-complete instances (ceiling %d)', n, cfg['max_objects'])
+        try:
+            select_candidates(work,output,cfg,db)
+        except BaseException:
+            db.close()
+            raise
     db.close()
 
 
