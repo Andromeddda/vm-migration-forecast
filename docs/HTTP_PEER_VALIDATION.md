@@ -6,9 +6,8 @@
 ## Автоматические проверки
 
 **119 passed, 1 deselected**, включая **24 peer-теста** и 17 прежних HTTP-тестов.
-Исключён только существующий тест
-`tests/test_deployment.py::test_no_network_or_paid_execution_defaults`: исходный
-ноутбук содержит CONNECT_GOOGLE=True, а тест ожидает False. Эти файлы не менялись.
+Это исторический результат до очистки окружения; актуальные проверки см.
+в [CLEANUP_VALIDATION.md](CLEANUP_VALIDATION.md).
 
 Проверены на настоящем локальном HTTP Range сервере и Parquet:
 

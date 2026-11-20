@@ -6,7 +6,6 @@ from vmforecast.data import prepare_usage,save_workload,load_workload
 from vmforecast.synthetic import make_synthetic
 from vmforecast.experiments import run_saved
 from vmforecast import WindowSignal,SimulationConfig
-from vmforecast.google2019 import ExtractionConfig,build_queries,BoundedExtractor
 from vmforecast.reporting import paired_difference
 
 
@@ -57,29 +56,6 @@ def test_run_resume_and_corruption_recovery(tmp_path):
     s3,_=run_saved(w,WindowSignal(),SimulationConfig(warmup=3),tmp_path)
     assert s3['migrations_completed']==s['migrations_completed']
     pd.read_parquet(p/'ticks.parquet')
-
-
-def test_query_scope_and_config_validation():
-    q=build_queries(ExtractionConfig(source_project='public-source'))
-    assert 'cohort_rank <= @n' in q['usage'] and '@keys' in q['events']
-    assert 'cohort' not in q
-    assert q['usage'].count('`public-source.clusterdata_2019_a.instance_usage`') == 1
-    assert 'time < @t1' in q['events'] and 'time >= @t0' not in q['events']
-    with pytest.raises(ValueError):ExtractionConfig(cell='a` WHERE true')
-
-
-def test_budget_stops_before_live_query(tmp_path):
-    class Dataset:location='US'
-    class Dry:total_bytes_processed=1000
-    class Client:
-        calls=[]
-        def query(self,sql,location,job_config):
-            assert job_config.dry_run  # any paid execution is a failure in this fake
-            self.calls.append(sql);return Dry()
-    ex=BoundedExtractor(Client(),ExtractionConfig(max_query_bytes=100),tmp_path)
-    ex.location='US'
-    with pytest.raises(RuntimeError):ex.query('test','SELECT 1',[],execute=True)
-    assert not ex.ledger['jobs']
 
 
 def test_ci_uses_paired_cases_and_requires_replicates():

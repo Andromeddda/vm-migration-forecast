@@ -9,16 +9,20 @@ from pathlib import Path
 import hashlib
 import json
 import os
-import re
 
 # Supported keys for .env-like config file 
 KEYS = {
-    'VMFORECAST_GOOGLE_CLOUD_PROJECT', 
-    'VMFORECAST_SOURCE_PROJECT',
     'VMFORECAST_STATE_DIR', 
     'VMFORECAST_DATA_DIR', 
     'VMFORECAST_RUNS_DIR',
     'VMFORECAST_MIN_FREE_GIB',
+}
+
+# Read old lab.env files without breaking local paths. Never expose these keys
+# to Settings or write them back during configure; no cloud runtime is retained.
+RETIRED_KEYS = {
+    'VMFORECAST_GOOGLE_CLOUD_PROJECT',
+    'VMFORECAST_SOURCE_PROJECT',
     'VMFORECAST_GCLOUD_BIN',
 }
 
@@ -35,6 +39,7 @@ def config_file(root, env=None) -> Path:
 # Read key-value pairs from .env-like config file
 def read_env(path) -> dict:
     values = {}
+    seen = set()
 
     # Non-existent path
     if not Path(path).exists():
@@ -51,8 +56,9 @@ def read_env(path) -> dict:
         key, separator, value = line.partition('=')
         key, value = key.strip(), value.strip()
 
-        if not separator or key not in KEYS or key in values:
+        if not separator or key not in KEYS | RETIRED_KEYS or key in seen:
             raise ValueError(f'Invalid/duplicate configuration key on line {number}')
+        seen.add(key)
 
         # Parse JSON
         if value.startswith('"'):
@@ -65,7 +71,8 @@ def read_env(path) -> dict:
 
         if not isinstance(value, str) or '\n' in value or '\x00' in value:
             raise ValueError(f'Invalid configuration value on line {number}')
-        values[key] = value
+        if key in KEYS:
+            values[key] = value
     return values
 
 # Return (value or default) if value is not a subdirectory of root
@@ -90,10 +97,7 @@ class Settings:
     state: Path
     data: Path
     runs: Path
-    project: str
-    source_project: str
     min_free_gib: int
-    gcloud: str
 
     @classmethod
     def load(cls, root=None, env=None):
@@ -122,23 +126,12 @@ class Settings:
             if a == b or a in b.parents or b in a.parents:
                 raise ValueError('State, data and runs directories must be disjoint')
 
-        # Parse Google Cloud project ID
-        project = values.get('VMFORECAST_GOOGLE_CLOUD_PROJECT', '')
-        if project and not re.fullmatch(r'[a-z][a-z0-9-]{4,28}[a-z0-9]', project):
-            raise ValueError('Use a Google Cloud project ID, not its display name or number')
-
-        # Parse source project (public google cloud dataset)
-        source = values.get('VMFORECAST_SOURCE_PROJECT', '')
-        if source and not re.fullmatch(r'[a-zA-Z0-9:.\-]+', source):
-            raise ValueError('Invalid dataset owner')
-
         # Parse mininmal free disk space
         minimum = int(values.get('VMFORECAST_MIN_FREE_GIB') or '3')
         if minimum < 1:
             raise ValueError('Minimum free disk space must be at least 1 GiB')
         
-        return cls(root, path, state, data, runs, project, source, minimum,
-                   values.get('VMFORECAST_GCLOUD_BIN') or 'gcloud')
+        return cls(root, path, state, data, runs, minimum)
 
     @property
     def python(self):
@@ -163,6 +156,8 @@ class Settings:
         })
         env.pop('VIRTUAL_ENV', None)
         env.pop('CONDA_PREFIX', None)
+        for key in RETIRED_KEYS:
+            env.pop(key, None)
 
         # Do not inherit a public server's authentication or remote routing config.
         for key in ('JUPYTER_TOKEN', 'JUPYTER_PASSWORD', 'JUPYTER_CONFIG_PATH', 'JUPYTER_PATH'):

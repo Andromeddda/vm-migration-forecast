@@ -3,7 +3,7 @@ from pathlib import Path
 import json
 import re
 
-TEXT_SUFFIXES = {'.py', '.toml', '.lock', '.md', '.yaml', '.yml', '.json', '.ipynb', '.example', '.sh', ''}
+TEXT_SUFFIXES = {'.py', '.toml', '.lock', '.md', '.yaml', '.yml', '.json', '.ipynb', '.example', '.sh', '.txt', ''}
 
 
 def clean(root):
@@ -28,7 +28,10 @@ def audit(root):
         if not p.is_file():
             continue
         relative = p.relative_to(root)
-        if any(part in {'.git', '__pycache__', '.pytest_cache'} for part in relative.parts):
+        # Checkout metadata and ignored standalone environments are not sources.
+        if any(part in {'.git', '.venv', '.venv-http'} for part in relative.parts):
+            continue
+        if any(part in {'__pycache__', '.pytest_cache'} for part in relative.parts):
             failures.append(str(relative)+': generated directory')
             continue
         if p.name.startswith('.env') and p.name != '.env.example':

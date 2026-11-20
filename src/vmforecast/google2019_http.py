@@ -2,7 +2,7 @@
 
 The output is a collection of COMPLETE per-instance files, not a truncated stream.
 No source archive is saved. Temporary sparse Parquet contains only fetched columns.
-SQL below runs in local DuckDB; it never invokes BigQuery or a cloud SQL service.
+SQL below runs in local DuckDB.
 """
 from __future__ import annotations
 

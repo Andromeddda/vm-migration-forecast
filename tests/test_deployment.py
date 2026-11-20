@@ -1,14 +1,13 @@
 """Regression coverage of configuration and the new deployment boundary."""
 import importlib.util
 import json
-import os
 from pathlib import Path
 import socket
 import subprocess
 import sys
 from unittest.mock import Mock
 import pytest
-from vmforecast.settings import Settings, read_env, config_file
+from vmforecast.settings import Settings, read_env, RETIRED_KEYS
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'deployment'))
@@ -33,16 +32,17 @@ def test_settings_import_without_scientific_dependencies():
 
 def test_config_literal_and_environment_precedence(tmp_path):
     p = tmp_path/'lab.env'
-    p.write_text('VMFORECAST_GOOGLE_CLOUD_PROJECT="test-project"\nVMFORECAST_GCLOUD_BIN="$(touch SENTINEL)"\n')
-    s = cfg(tmp_path, VMFORECAST_GOOGLE_CLOUD_PROJECT='another-project')
-    assert s.project == 'another-project'
-    assert s.gcloud == '$(touch SENTINEL)'
+    literal = str(tmp_path/'$(touch SENTINEL)')
+    p.write_text('VMFORECAST_DATA_DIR='+json.dumps(literal)+'\nVMFORECAST_MIN_FREE_GIB=4\n')
+    s = cfg(tmp_path, VMFORECAST_MIN_FREE_GIB='5')
+    assert s.min_free_gib == 5
+    assert s.data == Path(literal)
     assert not (ROOT/'SENTINEL').exists()
-    assert read_env(p)['VMFORECAST_GOOGLE_CLOUD_PROJECT'] == 'test-project'
+    assert read_env(p)['VMFORECAST_MIN_FREE_GIB'] == '4'
 
 
-@pytest.mark.parametrize('body', ['BAD_KEY=x', 'VMFORECAST_GCLOUD_BIN=x\nVMFORECAST_GCLOUD_BIN=y',
-                                  'VMFORECAST_GCLOUD_BIN="unterminated'])
+@pytest.mark.parametrize('body', ['BAD_KEY=x', 'VMFORECAST_DATA_DIR=x\nVMFORECAST_DATA_DIR=y',
+                                  'VMFORECAST_DATA_DIR="unterminated'])
 def test_bad_config_rejected(tmp_path, body):
     (tmp_path/'lab.env').write_text(body)
     with pytest.raises(ValueError):cfg(tmp_path)
@@ -102,76 +102,11 @@ def test_server_port_busy_preflight(monkeypatch):
 
 
 def test_failed_configure_preserves_previous_file(tmp_path, monkeypatch):
-    p = tmp_path/'lab.env';p.write_text('VMFORECAST_GCLOUD_BIN=gcloud\n')
+    p = tmp_path/'lab.env';p.write_text('VMFORECAST_MIN_FREE_GIB=3\n')
     monkeypatch.setenv('VMFORECAST_ENV_FILE', str(p))
-    args = cli.parser().parse_args(['configure', '--project', 'BAD PROJECT'])
+    args = cli.parser().parse_args(['configure', '--data-dir', 'relative'])
     with pytest.raises(ValueError):cli.configure(args)
-    assert p.read_text() == 'VMFORECAST_GCLOUD_BIN=gcloud\n'
-
-
-def test_auth_no_token_output_and_no_global_project_change(tmp_path, monkeypatch):
-    settings = cfg(tmp_path, VMFORECAST_GOOGLE_CLOUD_PROJECT='test-project', VMFORECAST_SOURCE_PROJECT='public-source')
-    monkeypatch.delenv('GOOGLE_APPLICATION_CREDENTIALS', raising=False)
-    monkeypatch.setattr(cli, 'executable', lambda value: 'gcloud')
-    calls=[]
-    def run(argv, **kwargs):
-        calls.append(argv)
-        assert 'billing' not in argv
-        assert 'set-quota-project' not in argv
-        return ''
-    monkeypatch.setattr(cli, 'run', run)
-    cli.authenticate(settings)
-    assert ['gcloud', 'auth', 'application-default', 'login', '--disable-quota-project'] in calls
-    assert not any('print-access-token' in call or 'config' in call for call in calls)
-    assert any('bigquery.googleapis.com' in call for call in calls)
-
-
-def test_no_network_or_paid_execution_defaults():
-    book = json.loads((ROOT/'notebooks/01_extract_google2019.ipynb').read_text())
-    sources = '\n'.join(''.join(c['source']) for c in book['cells'])
-    assert 'CONNECT_GOOGLE = False' in sources
-    assert 'EXECUTE_QUERIES = False' in sources
-    assert all(not c.get('outputs') for c in book['cells'])
-
-
-def test_gcloud_installer_hash_and_archive_validation(tmp_path, monkeypatch):
-    import hashlib
-    import io
-    import tarfile
-    import install_gcloud
-    monkeypatch.setattr(install_gcloud.platform, 'system', lambda: 'Linux')
-    monkeypatch.setattr(install_gcloud.platform, 'machine', lambda: 'x86_64')
-    def archive(name):
-        out=io.BytesIO()
-        with tarfile.open(fileobj=out, mode='w:gz') as stream:
-            body=b'#!/bin/sh\nexit 0\n';info=tarfile.TarInfo(name)
-            info.size=len(body);info.mode=0o755
-            stream.addfile(info,io.BytesIO(body))
-        return out.getvalue()
-    good=archive('google-cloud-sdk/bin/gcloud')
-    monkeypatch.setattr(install_gcloud.urllib.request, 'urlopen', lambda *a, **k: io.BytesIO(good))
-    monkeypatch.setattr(install_gcloud, 'ARCHIVES', {'x86_64': ('x86_64', 'incorrect')})
-    with pytest.raises(ValueError, match='SHA-256'):install_gcloud.install(cfg(tmp_path))
-    assert not install_gcloud.target(cfg(tmp_path)).exists()
-    bad=archive('google-cloud-sdk/../../escape')
-    monkeypatch.setattr(install_gcloud.urllib.request, 'urlopen', lambda *a, **k: io.BytesIO(bad))
-    monkeypatch.setattr(install_gcloud, 'ARCHIVES', {'x86_64': ('x86_64', hashlib.sha256(bad).hexdigest())})
-    with pytest.raises((ValueError, tarfile.FilterError)):install_gcloud.install(cfg(tmp_path))
-    monkeypatch.setattr(install_gcloud.urllib.request, 'urlopen', lambda *a, **k: io.BytesIO(good))
-    monkeypatch.setattr(install_gcloud, 'ARCHIVES', {'x86_64': ('x86_64', hashlib.sha256(good).hexdigest())})
-    binary=install_gcloud.install(cfg(tmp_path))
-    assert binary.is_file() and binary.stat().st_mode & 0o111
-
-
-def test_install_gcloud_records_path_without_manual_copy(tmp_path, monkeypatch):
-    import install_gcloud
-    settings=cfg(tmp_path)
-    binary=settings.state/'tools/gcloud/bin/gcloud'
-    monkeypatch.setattr(cli.Settings, 'load', lambda *a, **k: settings)
-    monkeypatch.setattr(install_gcloud, 'install', lambda _: binary)
-    monkeypatch.setattr(cli, 'run', lambda *a, **k: '')
-    assert cli.main(['install-gcloud']) == 0
-    assert read_env(settings.env_file)['VMFORECAST_GCLOUD_BIN'] == str(binary)
+    assert p.read_text() == 'VMFORECAST_MIN_FREE_GIB=3\n'
 
 
 def test_source_audit_checks_itself_and_detects_private_runtime_paths(tmp_path):
@@ -181,3 +116,91 @@ def test_source_audit_checks_itself_and_detects_private_runtime_paths(tmp_path):
     source_hygiene.audit(tmp_path)
     (tmp_path/'private.py').write_text('path='+repr('/'+'home'+'/someone/data'))
     with pytest.raises(ValueError, match='private.py'):source_hygiene.audit(tmp_path)
+
+
+def test_legacy_config_preserves_paths_and_configure_removes_retired_keys(tmp_path, monkeypatch):
+    paths = {f'VMFORECAST_{name}_DIR': str(tmp_path/name.lower())
+             for name in ('STATE', 'DATA', 'RUNS')}
+    retired = dict(zip(sorted(RETIRED_KEYS), ['unused-cli', 'unused-project', 'unused-source']))
+    original = paths | retired
+    p = tmp_path/'lab.env'
+    p.write_text(''.join(k+'='+json.dumps(v)+'\n' for k, v in original.items()))
+    monkeypatch.setenv('VMFORECAST_ENV_FILE', str(p))
+    for key in paths:
+        monkeypatch.delenv(key, raising=False)
+    for key, value in retired.items():
+        monkeypatch.setenv(key, value)
+    # Even an interactive configure must not prompt for any account/project.
+    monkeypatch.setattr('builtins.input', lambda *a: pytest.fail('configure must not prompt'))
+    settings = Settings.load(ROOT)
+    assert (settings.state, settings.data, settings.runs) == tuple(Path(v) for v in paths.values())
+    assert read_env(p) == paths
+    assert not any(key in settings.process_env() for key in RETIRED_KEYS)
+    cli.configure(cli.parser().parse_args(['configure']))
+    assert read_env(p) == paths
+    assert not any(key in p.read_text() for key in RETIRED_KEYS)
+    assert p.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize('argv', [
+    ['auth'], ['install-gcloud'], ['configure', '--project', 'old-project'],
+    ['configure', '--source-project', 'old-source'], ['configure', '--gcloud', 'old-cli'],
+])
+def test_removed_cloud_entry_points_are_rejected(argv):
+    with pytest.raises(SystemExit) as error:
+        cli.parser().parse_args(argv)
+    assert error.value.code == 2
+
+
+def test_configure_works_without_existing_config(tmp_path, monkeypatch):
+    path = tmp_path/'new-config/lab.env'
+    monkeypatch.setenv('VMFORECAST_ENV_FILE', str(path))
+    monkeypatch.setenv('XDG_DATA_HOME', str(tmp_path/'data-home'))
+    monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path/'state-home'))
+    for key in ('VMFORECAST_STATE_DIR', 'VMFORECAST_DATA_DIR', 'VMFORECAST_RUNS_DIR'):
+        monkeypatch.delenv(key, raising=False)
+    cli.configure(cli.parser().parse_args(['configure']))
+    assert path.is_file()
+    assert read_env(path) == {}
+    settings = Settings.load(ROOT)
+    assert all(p.is_dir() for p in (settings.state, settings.data, settings.runs))
+
+
+def test_local_notebooks_default_to_synthetic_and_have_no_saved_output():
+    paths = sorted((ROOT/'notebooks').glob('*.ipynb'))
+    assert [p.name for p in paths] == ['02_single_experiment.ipynb', '03_benchmark_and_reports.ipynb']
+    for path in paths:
+        book = json.loads(path.read_text())
+        assert all(not c.get('outputs') and c.get('execution_count') is None
+                   for c in book['cells'] if c['cell_type'] == 'code')
+    sources = '\n'.join(''.join(c['source']) for c in json.loads(paths[0].read_text())['cells'])
+    assert 'USE_PREPARED = False' in sources
+
+
+def test_notebook_verification_uses_a_synthetic_copy():
+    import nbformat
+    import verify_notebooks
+    book = nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell(
+        'USE_PREPARED = True\nresult = "prepared" if USE_PREPARED else "synthetic"')])
+    verified = verify_notebooks.synthetic_copy(book)
+    namespace = {}
+    exec(verified.cells[0].source, namespace)
+    assert namespace['result'] == 'synthetic'
+    assert 'USE_PREPARED = True' in book.cells[0].source
+
+
+def test_source_audit_ignores_git_metadata_but_rejects_generated_files(tmp_path):
+    import source_hygiene
+    git = tmp_path/'.git'
+    git.mkdir()
+    (git/'index').write_bytes(b'\x00not source')
+    venv = tmp_path/'.venv-http'
+    venv.mkdir()
+    (venv/'python').write_bytes(b'\x00not source')
+    (tmp_path/'requirements-http.txt').write_text('duckdb==1.4.2\n')
+    source_hygiene.audit(tmp_path)
+    cache = tmp_path/'__pycache__'
+    cache.mkdir()
+    (cache/'module.pyc').write_bytes(b'\x00compiled')
+    with pytest.raises(ValueError, match='generated directory'):
+        source_hygiene.audit(tmp_path)

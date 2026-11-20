@@ -1,102 +1,44 @@
 # VM Migration Forecasting
 
-Для продолжения одной HTTP-выгрузки на двух компьютерах (обратный data-проход,
-бюджет ноутбука 30 GB и импорт без повторных строк) см.
-[docs/HTTP_PEER.md](docs/HTTP_PEER.md). Начальный prefix повторно не скачивается.
-
-## Скачать Google 2019 без BigQuery, авторизации и браузера
-
-Для нового HTTP-экстрактора достаточно локального Python. Он собирает 30 дней
-историй выбранных инстансов, сохраняет полные истории в Parquet с жёстким
-пределом **15 GB = 15 000 000 000 байт**, контролирует рабочее место и память,
-возобновляет завершённые шарды после остановки. Google Cloud CLI и bootstrap
-для этого способа не нужны.
-
-```sh
-uv venv --python 3.11 .venv-http
-uv pip install --python .venv-http/bin/python -r requirements-http.txt
-screen -S google2019
-.venv-http/bin/python tools/download_google2019.py download  --output /path/to/data/google2019_http_a_30d --work /path/to/local-scratch/google2019-http
-```
-
-В `screen` нажать **Ctrl+A, затем D**, чтобы оставить процесс работать.
-Вернуться: `screen -r google2019`. При прерывании повторить **ту же команду
-с теми же параметрами и каталогами**. Полная инструкция, ограничения, состав
-данных и подготовка среза для ноутбуков: [docs/HTTP_EXTRACTION.md](docs/HTTP_EXTRACTION.md).
-
-**15 GB — предел и цель, а не обещанный объём:** приоритет — 30 дней,
-не более 25 000 инстансов и все доступные исследовательские поля. Если этот
-набор меньше 15 GB, экстрактор сохраняет его без искусственного раздувания.
-Трафик источника значительно больше результата; срок завершения зависит от сети.
-
 ## Клонировать проект
 
 ```sh
-git clone https://github.com/Andromeddda/vm-migration-forecast && cd vm-migration-forecast
+git clone https://github.com/Andromeddda/vm-migration-forecast
+cd vm-migration-forecast
 ```
 
 ## Проверить требования
 
 - Linux x86_64 или aarch64 с glibc
 - uv >= 0.9.5
-- gcloud >= 593.0.0
+- Для watchdog: Bash >= 4.4, systemd >= 243 и screen
 
-### Установить uv
+## Установить uv
 
 ```sh
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Открыть новый терминал и проверить установку:
+Открыть новый терминал:
 
 ```sh
 uv --version
 ```
 
-### Установить gcloud
-
-Скачать с [официального сайта](https://docs.cloud.google.com/sdk/docs/install-sdk).
-
-Или выполнить:
+## Настроить локальные каталоги
 
 ```sh
-sh lab install-gcloud
+sh lab configure
 ```
 
-## Настроить BigQuery Sandbox
-
-1. Войти в Google Cloud консоль:
-   https://console.cloud.google.com/bigquery
-
-2. Создать проект
-
-4. Скопировать Project ID
-
-## Сохранить настройки
+При необходимости выбрать другие непересекающиеся каталоги вне исходников:
 
 ```sh
-sh lab configure --project YOUR_PROJECT_ID
+sh lab configure \
+  --state-dir /path/to/local-state \
+  --data-dir /path/to/data \
+  --runs-dir /path/to/runs
 ```
-
-### Выбрать каталоги данных и результатов
-
-```sh
-sh lab configure --data-dir /path/to/data --runs-dir /path/to/runs
-```
-
-### Указать gcloud вне PATH
-
-```sh
-sh lab configure --gcloud /path/to/gcloud
-```
-
-## Авторизоваться
-
-```sh
-sh lab auth
-```
-
-В обоих окнах Google выбрать один аккаунт и разрешить доступ.
 
 ## Запустить Jupyter
 
@@ -106,52 +48,32 @@ sh lab bootstrap
 
 Открыть напечатанную ссылку на `http://localhost:8888` с токеном.
 
-## Выполнить ноутбук
-
 1. Открыть папку **notebooks**.
-2. Выбрать ноутбук:
-   - `01_extract_google2019.ipynb` — выгрузка Google Cluster 2019;
-   - `02_single_experiment.ipynb` — одиночный эксперимент;
-   - `03_benchmark_and_reports.ipynb` — серия экспериментов.
+2. Выбрать `02_single_experiment.ipynb` или `03_benchmark_and_reports.ipynb`.
 3. Выбрать kernel **VM Migration (local)**.
 4. Нажать **Run → Run All Cells**.
 
-Для выгрузки в ноутбуке 01 сначала включить `CONNECT_GOOGLE`, проверить dry run,
-затем включить `EXECUTE_QUERIES`.
+Для остановки нажать **Ctrl+C** в терминале сервера.
 
-## Запустить синтетику без Google Cloud
+## Скачать Google Cluster 2019 по HTTP
 
-```sh
-sh lab configure --project ""
-sh lab bootstrap
-```
-Открыть ноутбук 02 или 03.
+[Подготовить отдельное окружение и запустить загрузку](docs/HTTP_EXTRACTION.md).
+[Продолжить загрузку на двух компьютерах и объединить прогресс](docs/HTTP_PEER.md).
 
-## Остановить Jupyter
-
-**Ctrl+C** в терминале.
-
-## Проверить проект
+## Подготовить срез скачанных данных
 
 ```sh
-sh lab doctor
-sh lab test
-sh lab verify-notebooks
+sh lab prepare
+sh lab run -- python tools/download_google2019.py verify \
+  --dataset /path/to/data/google2019_http_a_30d
+sh lab run -- python tools/download_google2019.py prepare \
+  --dataset /path/to/data/google2019_http_a_30d \
+  --destination /path/to/data/google2019_http_a_30d_backtest/prepared \
+  --objects 64 --hours 168
 ```
 
-## Подготовить исходники к передаче
-
-```sh
-sh lab clean-notebooks
-sh lab audit
-```
-
-## Открыть документацию
-
-- [Выгрузить данные](docs/DATA_ACCESS.md)
-- [Прочитать правила проекта](docs/HANDBOOK.md)
-- [Посмотреть архитектуру](docs/ARCHITECTURE.md)
-- [Посмотреть результаты проверок](docs/VALIDATION.md)
+В ноутбуке 02 установить `USE_PREPARED = True` и указать `PREPARED_DIR`,
+совпадающий с `--destination`. Для синтетики оставить `USE_PREPARED = False`.
 
 ## Запустить команду в фоне с перезапуском
 
@@ -170,4 +92,28 @@ loginctl enable-linger "$USER"
 ./tools/watchdog.sh restart my-job
 ```
 
-- [Настроить надзор, лимит памяти и проверить перезапуск](docs/WATCHDOG.md)
+[Настроить надзор и лимит памяти](docs/WATCHDOG.md).
+
+## Проверить проект
+
+```sh
+sh lab doctor
+sh lab test
+sh lab verify-notebooks
+sh lab audit
+```
+
+## Очистить вывод ноутбуков перед коммитом
+
+```sh
+sh lab clean-notebooks
+```
+
+## Проверить обновление окружения
+
+```sh
+sh lab configure
+sh lab prepare
+```
+
+[Посмотреть состав очистки и результаты проверок](docs/CLEANUP_VALIDATION.md).

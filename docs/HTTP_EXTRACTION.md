@@ -1,9 +1,9 @@
-# Google Cluster 2019: локальная HTTP-выгрузка без BigQuery
+# Скачать Google Cluster 2019 по HTTP
 
 Скрипт: `tools/download_google2019.py`; реализация: `src/vmforecast/google2019_http.py`.
 Работает на Linux, без OAuth, Google SDK, Colab, Jupyter и браузерных WebSocket.
 HTTP-запросы к публичному хранилищу всё равно используют обычные сетевые соединения.
-SQL выполняется только локально в DuckDB. Квота SQL BigQuery не расходуется.
+SQL выполняется только локально в DuckDB.
 
 ## Установка и запуск на выходные
 
@@ -13,10 +13,12 @@ SQL выполняется только локально в DuckDB. Квота S
 uv venv --python 3.11 .venv-http
 uv pip install --python .venv-http/bin/python -r requirements-http.txt
 screen -S google2019
-.venv-http/bin/python tools/download_google2019.py download --output ~/projects/assets/andrew/migration-data/google2019_http_a_30d --work ~/projects/assets/andrew/migration-work/google2019-http
+.venv-http/bin/python tools/download_google2019.py download \
+  --output /path/to/data/google2019_http_a_30d \
+  --work /path/to/local-scratch/google2019-http
 ```
 
-Заменить `USER` и пути. Каталоги `--work` и `--output` должны быть раздельными,
+Указать свои пути. Каталоги `--work` и `--output` должны быть раздельными,
 не вложенными друг в друга. Рабочий каталог — на локальном диске, не на сетевом
 монтировании. Лучше сначала сохранять результат локально и переносить готовый
 каталог после завершения. Другие файлы на диске скрипт не удаляет.
@@ -211,7 +213,7 @@ data resume: ...
 Parquet-экспорту usage cell a (~408 GiB), плюс первый проход и остальные таблицы.
 В `--columns core` скачиваются только поля для бэктестов и отбора; трафик меньше,
 но в результате не будет дополнительных usage-метрик и распределений.
-Ни один режим не расходует SQL-квоту BigQuery.
+Все режимы работают через публичный HTTP и локальный DuckDB.
 
 Не обещаем ровно 15 GB: 30 дней, ограничение числа инстансов, имеющиеся измерения
 и сжатие могут дать меньший набор. research сохраняет дополнительные реальные
@@ -251,7 +253,7 @@ Parquet-экспорту usage cell a (~408 GiB), плюс первый прох
 .venv-http/bin/python - <<'PY'
 import json
 from pathlib import Path
-p = Path('/home/USER/migration-data/google2019_http_a_30d')
+p = Path('/path/to/data/google2019_http_a_30d')
 m = json.loads((p/'manifest.json').read_text())
 print({k:m[k] for k in ['status','instances','full_window_backtest_valid_instances','output_bytes']})
 PY
@@ -259,13 +261,13 @@ PY
 
 ## Сразу запустить бэктест на ограниченном срезе
 
-Для подготовки нужен сам пакет проекта (Google extra не нужен):
+Подготовить срез в окружении `lab`:
 
 ```sh
-uv pip install --python .venv-http/bin/python -e .
-.venv-http/bin/python tools/download_google2019.py prepare \
-  --dataset /home/USER/migration-data/google2019_http_a_30d \
-  --destination /home/USER/migration-data/google2019_http_a_30d_backtest/prepared \
+sh lab prepare
+sh lab run -- python tools/download_google2019.py prepare \
+  --dataset /path/to/data/google2019_http_a_30d \
+  --destination /path/to/data/google2019_http_a_30d_backtest/prepared \
   --objects 64 --hours 168
 ```
 
@@ -281,10 +283,11 @@ Capacity хостов в подготовленном workload синтетич�
 часу; это не восстановленное реальное размещение Google. Исходные host events
 сохранены отдельно для последующей работы.
 
-В notebook 02 включить `USE_GOOGLE=True` и заменить загрузку workload на:
+В notebook 02 включить `USE_PREPARED=True` и задать `PREPARED_DIR` равным
+каталогу `--destination`. Для программного чтения:
 
 ```python
-workload = load_workload(Path('/home/USER/migration-data/google2019_http_a_30d_backtest/prepared'))
+workload = load_workload(Path('/path/to/data/google2019_http_a_30d_backtest/prepared'))
 WARMUP = 12
 ```
 

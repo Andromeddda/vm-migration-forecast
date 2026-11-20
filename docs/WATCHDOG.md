@@ -287,9 +287,6 @@ python -m pytest tests/test_watchdog.py -q
 - Общий прогон: 144 passed, 1 skipped, 1 deselected.
 - Пропущена проверка настоящим `systemd-analyze`: у исполняющей песочницы нет
   `/tmp`, жёстко требуемого этой утилитой; переменная TMPDIR это не меняет.
-- Исключён существующий `test_no_network_or_paid_execution_defaults`: в исходном
-  ноутбуке 01 уже включён `CONNECT_GOOGLE`, а тест требует `False`. Отдельный запуск
-  подтверждает этот сбой; watchdog ноутбук не изменяет.
 - Реальная связка systemd user manager + screen + logind, фактический suspend,
   системный OOM и применение cgroup-лимита на пользовательской машине **не были
   проверены**: в песочнице нет screen, user manager и доступа к logind.
